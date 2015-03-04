@@ -153,6 +153,11 @@ object MimaExcludes {
             ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.RealClock"),
             ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.Clock"),
             ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.TestClock")
+          ) ++ Seq(
+            // SPARK-6051
+            ProblemFilters.exclude[MissingMethodProblem](
+              "org.apache.spark.streaming.kafka.ReliableKafkaReceiver" +
+              ".org$apache$spark$streaming$kafka$ReliableKafkaReceiver$$zkClient")
           )
 
         case v if v.startsWith("1.2") =>
