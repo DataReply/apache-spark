@@ -517,6 +517,9 @@ class SparkContext(config: SparkConf) extends Logging with ExecutorAllocationCli
     _taskScheduler.postStartHook()
     _env.metricsSystem.registerSource(new DAGSchedulerSource(dagScheduler))
     _env.metricsSystem.registerSource(new BlockManagerSource(_env.blockManager))
+    _executorAllocationManager.foreach { e =>
+      _env.metricsSystem.registerSource(e.executorAllocationManagerSource)
+    }
   } catch {
     case NonFatal(e) =>
       logError("Error initializing SparkContext.", e)
