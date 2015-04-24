@@ -39,9 +39,11 @@ class StreamingJobProgressListenerSuite extends TestSuiteBase with Matchers {
       0 -> Array(ReceivedBlockInfo(0, 100, null), ReceivedBlockInfo(0, 200, null)),
       1 -> Array(ReceivedBlockInfo(1, 300, null))
     )
+    val directBlockInfo = Map[Int, Array[DirectBlockInfo]]()
 
     // onBatchSubmitted
-    val batchInfoSubmitted = BatchInfo(Time(1000), receivedBlockInfo, 1000, None, None)
+    val batchInfoSubmitted = BatchInfo(Time(1000), receivedBlockInfo, directBlockInfo, 1000,
+      None, None)
     listener.onBatchSubmitted(StreamingListenerBatchSubmitted(batchInfoSubmitted))
     listener.waitingBatches should be (List(batchInfoSubmitted))
     listener.runningBatches should be (Nil)
@@ -53,7 +55,8 @@ class StreamingJobProgressListenerSuite extends TestSuiteBase with Matchers {
     listener.numTotalReceivedRecords should be (0)
 
     // onBatchStarted
-    val batchInfoStarted = BatchInfo(Time(1000), receivedBlockInfo, 1000, Some(2000), None)
+    val batchInfoStarted = BatchInfo(Time(1000), receivedBlockInfo, directBlockInfo, 1000,
+      Some(2000), None)
     listener.onBatchStarted(StreamingListenerBatchStarted(batchInfoStarted))
     listener.waitingBatches should be (Nil)
     listener.runningBatches should be (List(batchInfoStarted))
@@ -65,7 +68,8 @@ class StreamingJobProgressListenerSuite extends TestSuiteBase with Matchers {
     listener.numTotalReceivedRecords should be (600)
 
     // onBatchCompleted
-    val batchInfoCompleted = BatchInfo(Time(1000), receivedBlockInfo, 1000, Some(2000), None)
+    val batchInfoCompleted = BatchInfo(Time(1000), receivedBlockInfo, directBlockInfo, 1000,
+      Some(2000), None)
     listener.onBatchCompleted(StreamingListenerBatchCompleted(batchInfoCompleted))
     listener.waitingBatches should be (Nil)
     listener.runningBatches should be (Nil)
@@ -107,7 +111,10 @@ class StreamingJobProgressListenerSuite extends TestSuiteBase with Matchers {
       0 -> Array(ReceivedBlockInfo(0, 100, null), ReceivedBlockInfo(0, 200, null)),
       1 -> Array(ReceivedBlockInfo(1, 300, null))
     )
-    val batchInfoCompleted = BatchInfo(Time(1000), receivedBlockInfo, 1000, Some(2000), None)
+    val directBlockInfo = Map[Int, Array[DirectBlockInfo]]()
+
+    val batchInfoCompleted = BatchInfo(Time(1000), receivedBlockInfo, directBlockInfo, 1000,
+      Some(2000), None)
 
     for(_ <- 0 until (limit + 10)) {
       listener.onBatchCompleted(StreamingListenerBatchCompleted(batchInfoCompleted))
