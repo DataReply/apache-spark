@@ -22,37 +22,36 @@ import javax.servlet.http.HttpServletRequest
 import scala.xml.Node
 
 import org.apache.spark.scheduler.{Schedulable, StageInfo}
-import org.apache.spark.ui.Page._
-import org.apache.spark.ui.UIUtils
+import org.apache.spark.ui.{WebUIPage, UIUtils}
 
 /** Page showing specific pool details */
-private[ui] class PoolPage(parent: JobProgressUI) {
-  private val appName = parent.appName
-  private val basePath = parent.basePath
-  private val live = parent.live
+private[ui] class PoolPage(parent: StagesTab) extends WebUIPage("pool") {
   private val sc = parent.sc
-  private lazy val listener = parent.listener
+  private val listener = parent.listener
 
   def render(request: HttpServletRequest): Seq[Node] = {
     listener.synchronized {
       val poolName = request.getParameter("poolname")
+      require(poolName != null && poolName.nonEmpty, "Missing poolname parameter")
+
       val poolToActiveStages = listener.poolToActiveStages
       val activeStages = poolToActiveStages.get(poolName) match {
         case Some(s) => s.values.toSeq
         case None => Seq[StageInfo]()
       }
-      val activeStagesTable = new StageTable(activeStages.sortBy(_.submissionTime).reverse, parent)
+      val activeStagesTable = new StageTableBase(activeStages.sortBy(_.submissionTime).reverse,
+        parent.basePath, parent.listener, isFairScheduler = parent.isFairScheduler,
+        killEnabled = parent.killEnabled)
 
       // For now, pool information is only accessible in live UIs
-      val pools = if (live) Seq(sc.getPoolForName(poolName).get) else Seq[Schedulable]()
+      val pools = sc.map(_.getPoolForName(poolName).get).toSeq
       val poolTable = new PoolTable(pools, parent)
 
       val content =
         <h4>Summary </h4> ++ poolTable.toNodeSeq ++
         <h4>{activeStages.size} Active Stages</h4> ++ activeStagesTable.toNodeSeq
 
-      UIUtils.headerSparkPage(
-        content, basePath, appName, "Fair Scheduler Pool: " + poolName, Stages)
+      UIUtils.headerSparkPage("Fair Scheduler Pool: " + poolName, content, parent)
     }
   }
 }

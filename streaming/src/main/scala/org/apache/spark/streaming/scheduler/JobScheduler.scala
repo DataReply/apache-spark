@@ -17,12 +17,15 @@
 
 package org.apache.spark.streaming.scheduler
 
-import scala.util.{Failure, Success, Try}
-import scala.collection.JavaConversions._
 import java.util.concurrent.{TimeUnit, ConcurrentHashMap, Executors}
-import akka.actor.{ActorRef, Actor, Props}
-import org.apache.spark.{SparkException, Logging, SparkEnv}
+
+import scala.collection.JavaConversions._
+import scala.util.{Failure, Success}
+
+import org.apache.spark.Logging
+import org.apache.spark.rdd.PairRDDFunctions
 import org.apache.spark.streaming._
+import org.apache.spark.util.EventLoop
 
 
 private[scheduler] sealed trait JobSchedulerEvent
@@ -39,57 +42,75 @@ class JobScheduler(val ssc: StreamingContext) extends Logging {
 
   private val jobSets = new ConcurrentHashMap[Time, JobSet]
   private val numConcurrentJobs = ssc.conf.getInt("spark.streaming.concurrentJobs", 1)
-  private val executor = Executors.newFixedThreadPool(numConcurrentJobs)
+  private val jobExecutor = Executors.newFixedThreadPool(numConcurrentJobs)
   private val jobGenerator = new JobGenerator(this)
   val clock = jobGenerator.clock
   val listenerBus = new StreamingListenerBus()
 
   // These two are created only when scheduler starts.
-  // eventActor not being null means the scheduler has been started and not stopped
-  var networkInputTracker: NetworkInputTracker = null
-  private var eventActor: ActorRef = null
+  // eventLoop not being null means the scheduler has been started and not stopped
+  var receiverTracker: ReceiverTracker = null
+  private var eventLoop: EventLoop[JobSchedulerEvent] = null
 
+  def start(): Unit = synchronized {
+    if (eventLoop != null) return // scheduler has already been started
 
-  def start() = synchronized {
-    if (eventActor != null) {
-      throw new SparkException("JobScheduler already started")
+    logDebug("Starting JobScheduler")
+    eventLoop = new EventLoop[JobSchedulerEvent]("JobScheduler") {
+      override protected def onReceive(event: JobSchedulerEvent): Unit = processEvent(event)
+
+      override protected def onError(e: Throwable): Unit = reportError("Error in job scheduler", e)
     }
+    eventLoop.start()
 
-    eventActor = ssc.env.actorSystem.actorOf(Props(new Actor {
-      def receive = {
-        case event: JobSchedulerEvent => processEvent(event)
-      }
-    }), "JobScheduler")
-    listenerBus.start()
-    networkInputTracker = new NetworkInputTracker(ssc)
-    networkInputTracker.start()
-    Thread.sleep(1000)
+    listenerBus.start(ssc.sparkContext)
+    receiverTracker = new ReceiverTracker(ssc)
+    receiverTracker.start()
     jobGenerator.start()
-    logInfo("JobScheduler started")
+    logInfo("Started JobScheduler")
   }
 
-  def stop() = synchronized {
-    if (eventActor != null) {
-      jobGenerator.stop()
-      networkInputTracker.stop()
-      executor.shutdown()
-      if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
-        executor.shutdownNow()
-      }
-      listenerBus.stop()
-      ssc.env.actorSystem.stop(eventActor)
-      logInfo("JobScheduler stopped")
-    }
-  }
+  def stop(processAllReceivedData: Boolean): Unit = synchronized {
+    if (eventLoop == null) return // scheduler has already been stopped
+    logDebug("Stopping JobScheduler")
 
-  def runJobs(time: Time, jobs: Seq[Job]) {
-    if (jobs.isEmpty) {
-      logInfo("No jobs added for time " + time)
+    // First, stop receiving
+    receiverTracker.stop(processAllReceivedData)
+
+    // Second, stop generating jobs. If it has to process all received data,
+    // then this will wait for all the processing through JobScheduler to be over.
+    jobGenerator.stop(processAllReceivedData)
+
+    // Stop the executor for receiving new jobs
+    logDebug("Stopping job executor")
+    jobExecutor.shutdown()
+
+    // Wait for the queued jobs to complete if indicated
+    val terminated = if (processAllReceivedData) {
+      jobExecutor.awaitTermination(1, TimeUnit.HOURS)  // just a very large period of time
     } else {
-      val jobSet = new JobSet(time, jobs)
-      jobSets.put(time, jobSet)
-      jobSet.jobs.foreach(job => executor.execute(new JobHandler(job)))
-      logInfo("Added jobs for time " + time)
+      jobExecutor.awaitTermination(2, TimeUnit.SECONDS)
+    }
+    if (!terminated) {
+      jobExecutor.shutdownNow()
+    }
+    logDebug("Stopped job executor")
+
+    // Stop everything else
+    listenerBus.stop()
+    eventLoop.stop()
+    eventLoop = null
+    logInfo("Stopped JobScheduler")
+  }
+
+  def submitJobSet(jobSet: JobSet) {
+    if (jobSet.jobs.isEmpty) {
+      logInfo("No jobs added for time " + jobSet.time)
+    } else {
+      listenerBus.post(StreamingListenerBatchSubmitted(jobSet.toBatchInfo))
+      jobSets.put(jobSet.time, jobSet)
+      jobSet.jobs.foreach(job => jobExecutor.execute(new JobHandler(job)))
+      logInfo("Added jobs for time " + jobSet.time)
     }
   }
 
@@ -98,7 +119,7 @@ class JobScheduler(val ssc: StreamingContext) extends Logging {
   }
 
   def reportError(msg: String, e: Throwable) {
-    eventActor ! ErrorReported(msg, e)
+    eventLoop.post(ErrorReported(msg, e))
   }
 
   private def processEvent(event: JobSchedulerEvent) {
@@ -116,12 +137,14 @@ class JobScheduler(val ssc: StreamingContext) extends Logging {
 
   private def handleJobStart(job: Job) {
     val jobSet = jobSets.get(job.time)
-    if (!jobSet.hasStarted) {
+    val isFirstJobOfJobSet = !jobSet.hasStarted
+    jobSet.handleJobStart(job)
+    if (isFirstJobOfJobSet) {
+      // "StreamingListenerBatchStarted" should be posted after calling "handleJobStart" to get the
+      // correct "jobSet.processingStartTime".
       listenerBus.post(StreamingListenerBatchStarted(jobSet.toBatchInfo))
     }
-    jobSet.handleJobStart(job)
     logInfo("Starting job " + job.id + " from job set of time " + jobSet.time)
-    SparkEnv.set(ssc.env)
   }
 
   private def handleJobCompletion(job: Job) {
@@ -151,9 +174,14 @@ class JobScheduler(val ssc: StreamingContext) extends Logging {
 
   private class JobHandler(job: Job) extends Runnable {
     def run() {
-      eventActor ! JobStarted(job)
-      job.run()
-      eventActor ! JobCompleted(job)
+      eventLoop.post(JobStarted(job))
+      // Disable checks for existing output directories in jobs launched by the streaming scheduler,
+      // since we may need to write output to an existing directory during checkpoint recovery;
+      // see SPARK-4835 for more details.
+      PairRDDFunctions.disableOutputSpecValidation.withValue(true) {
+        job.run()
+      }
+      eventLoop.post(JobCompleted(job))
     }
   }
 }

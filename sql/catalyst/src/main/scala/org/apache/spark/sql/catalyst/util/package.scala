@@ -19,20 +19,11 @@ package org.apache.spark.sql.catalyst
 
 import java.io.{PrintWriter, ByteArrayOutputStream, FileInputStream, File}
 
-package object util {
-  /**
-   * Returns a path to a temporary file that probably does not exist.
-   * Note, there is always the race condition that someone created this
-   * file since the last time we checked.  Thus, this shouldn't be used
-   * for anything security conscious.
-   */
-  def getTempFilePath(prefix: String, suffix: String = ""): File = {
-    val tempFile = File.createTempFile(prefix, suffix)
-    tempFile.delete()
-    tempFile
-  }
+import org.apache.spark.util.Utils
 
-  def fileToString(file: File, encoding: String = "UTF-8") = {
+package object util {
+
+  def fileToString(file: File, encoding: String = "UTF-8"): String = {
     val inStream = new FileInputStream(file)
     val outStream = new ByteArrayOutputStream
     try {
@@ -54,7 +45,7 @@ package object util {
   def resourceToString(
       resource:String,
       encoding: String = "UTF-8",
-      classLoader: ClassLoader = this.getClass.getClassLoader) = {
+      classLoader: ClassLoader = Utils.getSparkClassLoader): String = {
     val inStream = classLoader.getResourceAsStream(resource)
     val outStream = new ByteArrayOutputStream
     try {
@@ -102,7 +93,7 @@ package object util {
     new String(out.toByteArray)
   }
 
-  def stringOrNull(a: AnyRef) = if (a == null) null else a.toString
+  def stringOrNull(a: AnyRef): String = if (a == null) null else a.toString
 
   def benchmark[A](f: => A): A = {
     val startTime = System.nanoTime()
@@ -113,7 +104,7 @@ package object util {
   }
 
   /* FIX ME
-  implicit class debugLogging(a: AnyRef) {
+  implicit class debugLogging(a: Any) {
     def debugLogging() {
       org.apache.log4j.Logger.getLogger(a.getClass.getName).setLevel(org.apache.log4j.Level.DEBUG)
     }

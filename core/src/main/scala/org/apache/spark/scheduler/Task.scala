@@ -17,17 +17,17 @@
 
 package org.apache.spark.scheduler
 
-import java.io.{DataInputStream, DataOutputStream}
+import java.io.{ByteArrayOutputStream, DataInputStream, DataOutputStream}
 import java.nio.ByteBuffer
 
 import scala.collection.mutable.HashMap
 
-import it.unimi.dsi.fastutil.io.FastByteArrayOutputStream
-
-import org.apache.spark.TaskContext
+import org.apache.spark.{TaskContextImpl, TaskContext}
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.serializer.SerializerInstance
 import org.apache.spark.util.ByteBufferInputStream
+import org.apache.spark.util.Utils
+
 
 /**
  * A unit of execution. We have two kinds of Task's in Spark:
@@ -35,7 +35,7 @@ import org.apache.spark.util.ByteBufferInputStream
  * - [[org.apache.spark.scheduler.ResultTask]]
  *
  * A Spark job consists of one or more stages. The very last stage in a job consists of multiple
- * ResultTask's, while earlier stages consist of ShuffleMapTasks. A ResultTask executes the task
+ * ResultTasks, while earlier stages consist of ShuffleMapTasks. A ResultTask executes the task
  * and sends the task output back to the driver application. A ShuffleMapTask executes the task
  * and divides the task output to multiple buckets (based on the task's partitioner).
  *
@@ -44,12 +44,28 @@ import org.apache.spark.util.ByteBufferInputStream
  */
 private[spark] abstract class Task[T](val stageId: Int, var partitionId: Int) extends Serializable {
 
-  final def run(attemptId: Long): T = {
-    context = new TaskContext(stageId, partitionId, attemptId, runningLocally = false)
+  /**
+   * Called by [[Executor]] to run this task.
+   *
+   * @param taskAttemptId an identifier for this task attempt that is unique within a SparkContext.
+   * @param attemptNumber how many times this task has been attempted (0 for the first attempt)
+   * @return the result of the task
+   */
+  final def run(taskAttemptId: Long, attemptNumber: Int): T = {
+    context = new TaskContextImpl(stageId = stageId, partitionId = partitionId,
+      taskAttemptId = taskAttemptId, attemptNumber = attemptNumber, runningLocally = false)
+    TaskContext.setTaskContext(context)
+    context.taskMetrics.setHostname(Utils.localHostName())
+    taskThread = Thread.currentThread()
     if (_killed) {
-      kill()
+      kill(interruptThread = false)
     }
-    runTask(context)
+    try {
+      runTask(context)
+    } finally {
+      context.markTaskCompleted()
+      TaskContext.unset()
+    }
   }
 
   def runTask(context: TaskContext): T
@@ -62,11 +78,16 @@ private[spark] abstract class Task[T](val stageId: Int, var partitionId: Int) ex
   var metrics: Option[TaskMetrics] = None
 
   // Task context, to be initialized in run().
-  @transient protected var context: TaskContext = _
+  @transient protected var context: TaskContextImpl = _
+
+  // The actual Thread on which the task is running, if any. Initialized in run().
+  @volatile @transient private var taskThread: Thread = _
 
   // A flag to indicate whether the task is killed. This is used in case context is not yet
   // initialized when kill() is invoked.
   @volatile @transient private var _killed = false
+
+  protected var _executorDeserializeTime: Long = 0
 
   /**
    * Whether the task has been killed.
@@ -74,16 +95,25 @@ private[spark] abstract class Task[T](val stageId: Int, var partitionId: Int) ex
   def killed: Boolean = _killed
 
   /**
+   * Returns the amount of time spent deserializing the RDD and function to be run.
+   */
+  def executorDeserializeTime: Long = _executorDeserializeTime
+
+  /**
    * Kills a task by setting the interrupted flag to true. This relies on the upper level Spark
    * code and user code to properly handle the flag. This function should be idempotent so it can
    * be called multiple times.
+   * If interruptThread is true, we will also call Thread.interrupt() on the Task's executor thread.
    */
-  def kill() {
+  def kill(interruptThread: Boolean) {
     _killed = true
     if (context != null) {
-      context.interrupted = true
+      context.markInterrupted()
     }
-  }
+    if (interruptThread && taskThread != null) {
+      taskThread.interrupt()
+    }
+  }  
 }
 
 /**
@@ -104,7 +134,7 @@ private[spark] object Task {
       serializer: SerializerInstance)
     : ByteBuffer = {
 
-    val out = new FastByteArrayOutputStream(4096)
+    val out = new ByteArrayOutputStream(4096)
     val dataOut = new DataOutputStream(out)
 
     // Write currentFiles
@@ -125,8 +155,7 @@ private[spark] object Task {
     dataOut.flush()
     val taskBytes = serializer.serialize(task).array()
     out.write(taskBytes)
-    out.trim()
-    ByteBuffer.wrap(out.array)
+    ByteBuffer.wrap(out.toByteArray)
   }
 
   /**

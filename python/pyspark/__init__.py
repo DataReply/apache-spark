@@ -20,34 +20,39 @@ PySpark is the Python API for Spark.
 
 Public classes:
 
-  - L{SparkContext<pyspark.context.SparkContext>}
+  - :class:`SparkContext`:
       Main entry point for Spark functionality.
-  - L{RDD<pyspark.rdd.RDD>}
+  - :class:`RDD`:
       A Resilient Distributed Dataset (RDD), the basic abstraction in Spark.
-  - L{Broadcast<pyspark.broadcast.Broadcast>}
+  - :class:`Broadcast`:
       A broadcast variable that gets reused across tasks.
-  - L{Accumulator<pyspark.accumulators.Accumulator>}
+  - :class:`Accumulator`:
       An "add-only" shared variable that tasks can only add values to.
-  - L{SparkConf<pyspark.conf.SparkConf>}
+  - :class:`SparkConf`:
       For configuring Spark.
-  - L{SparkFiles<pyspark.files.SparkFiles>}
+  - :class:`SparkFiles`:
       Access files shipped with jobs.
-  - L{StorageLevel<pyspark.storagelevel.StorageLevel>}
+  - :class:`StorageLevel`:
       Finer-grained cache persistence levels.
+
 """
-
-
-
-import sys
-import os
-sys.path.insert(0, os.path.join(os.environ["SPARK_HOME"], "python/lib/py4j-0.8.1-src.zip"))
-
 
 from pyspark.conf import SparkConf
 from pyspark.context import SparkContext
 from pyspark.rdd import RDD
 from pyspark.files import SparkFiles
 from pyspark.storagelevel import StorageLevel
+from pyspark.accumulators import Accumulator, AccumulatorParam
+from pyspark.broadcast import Broadcast
+from pyspark.serializers import MarshalSerializer, PickleSerializer
+from pyspark.status import *
+from pyspark.profiler import Profiler, BasicProfiler
 
+# for back compatibility
+from pyspark.sql import SQLContext, HiveContext, SchemaRDD, Row
 
-__all__ = ["SparkConf", "SparkContext", "RDD", "SparkFiles", "StorageLevel"]
+__all__ = [
+    "SparkConf", "SparkContext", "SparkFiles", "RDD", "StorageLevel", "Broadcast",
+    "Accumulator", "AccumulatorParam", "MarshalSerializer", "PickleSerializer",
+    "StatusTracker", "SparkJobInfo", "SparkStageInfo", "Profiler", "BasicProfiler",
+]

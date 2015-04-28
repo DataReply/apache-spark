@@ -17,128 +17,122 @@
 
 package org.apache.spark.sql.parquet
 
-import org.scalatest.{BeforeAndAfterAll, FunSuite}
+import org.scalatest.BeforeAndAfterAll
 
-import org.apache.hadoop.fs.{FileSystem, Path}
-import org.apache.hadoop.mapreduce.Job
-import parquet.hadoop.ParquetFileWriter
-import parquet.hadoop.util.ContextUtil
-import parquet.schema.MessageTypeParser
-
-import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{SQLConf, QueryTest}
 import org.apache.spark.sql.catalyst.expressions.Row
-import org.apache.spark.sql.catalyst.util.getTempFilePath
 import org.apache.spark.sql.test.TestSQLContext
-
-// Implicits
 import org.apache.spark.sql.test.TestSQLContext._
 
-class ParquetQuerySuite extends FunSuite with BeforeAndAfterAll {
-  override def beforeAll() {
-    ParquetTestData.writeFile()
+/**
+ * A test suite that tests various Parquet queries.
+ */
+class ParquetQuerySuiteBase extends QueryTest with ParquetTest {
+  val sqlContext = TestSQLContext
+
+  test("simple select queries") {
+    withParquetTable((0 until 10).map(i => (i, i.toString)), "t") {
+      checkAnswer(sql("SELECT _1 FROM t where t._1 > 5"), (6 until 10).map(Row.apply(_)))
+      checkAnswer(sql("SELECT _1 FROM t as tmp where tmp._1 < 5"), (0 until 5).map(Row.apply(_)))
+    }
   }
 
-  override def afterAll() {
-    ParquetTestData.testFile.delete()
+  test("appending") {
+    val data = (0 until 10).map(i => (i, i.toString))
+    createDataFrame(data).toDF("c1", "c2").registerTempTable("tmp")
+    withParquetTable(data, "t") {
+      sql("INSERT INTO TABLE t SELECT * FROM tmp")
+      checkAnswer(table("t"), (data ++ data).map(Row.fromTuple))
+    }
+    catalog.unregisterTable(Seq("tmp"))
   }
 
-  test("self-join parquet files") {
-    val x = ParquetTestData.testData.subquery('x)
-    val y = ParquetTestData.testData.subquery('y)
-    val query = x.join(y).where("x.myint".attr === "y.myint".attr)
+  test("overwriting") {
+    val data = (0 until 10).map(i => (i, i.toString))
+    createDataFrame(data).toDF("c1", "c2").registerTempTable("tmp")
+    withParquetTable(data, "t") {
+      sql("INSERT OVERWRITE TABLE t SELECT * FROM tmp")
+      checkAnswer(table("t"), data.map(Row.fromTuple))
+    }
+    catalog.unregisterTable(Seq("tmp"))
+  }
 
-    // Check to make sure that the attributes from either side of the join have unique expression
-    // ids.
-    query.queryExecution.analyzed.output.filter(_.name == "myint") match {
-      case Seq(i1, i2) if(i1.exprId == i2.exprId) =>
-        fail(s"Duplicate expression IDs found in query plan: $query")
-      case Seq(_, _) => // All good
+  test("self-join") {
+    // 4 rows, cells of column 1 of row 2 and row 4 are null
+    val data = (1 to 4).map { i =>
+      val maybeInt = if (i % 2 == 0) None else Some(i)
+      (maybeInt, i.toString)
     }
 
-    // TODO: We can't run this query as it NPEs
-  }
+    withParquetTable(data, "t") {
+      val selfJoin = sql("SELECT * FROM t x JOIN t y WHERE x._1 = y._1")
+      val queryOutput = selfJoin.queryExecution.analyzed.output
 
-  test("Import of simple Parquet file") {
-    val result = getRDD(ParquetTestData.testData).collect()
-    assert(result.size === 15)
-    result.zipWithIndex.foreach {
-      case (row, index) => {
-        val checkBoolean =
-          if (index % 3 == 0)
-            row(0) == true
-          else
-            row(0) == false
-        assert(checkBoolean === true, s"boolean field value in line $index did not match")
-        if (index % 5 == 0) assert(row(1) === 5, s"int field value in line $index did not match")
-        assert(row(2) === "abc", s"string field value in line $index did not match")
-        assert(row(3) === (index.toLong << 33), s"long value in line $index did not match")
-        assert(row(4) === 2.5F, s"float field value in line $index did not match")
-        assert(row(5) === 4.5D, s"double field value in line $index did not match")
+      assertResult(4, "Field count mismatches")(queryOutput.size)
+      assertResult(2, "Duplicated expression ID in query plan:\n $selfJoin") {
+        queryOutput.filter(_.name == "_1").map(_.exprId).size
       }
+
+      checkAnswer(selfJoin, List(Row(1, "1", 1, "1"), Row(3, "3", 3, "3")))
     }
   }
 
-  test("Projection of simple Parquet file") {
-    val scanner = new ParquetTableScan(
-      ParquetTestData.testData.output,
-      ParquetTestData.testData,
-      None)(TestSQLContext.sparkContext)
-    val projected = scanner.pruneColumns(ParquetTypesConverter
-      .convertToAttributes(MessageTypeParser
-      .parseMessageType(ParquetTestData.subTestSchema)))
-    assert(projected.output.size === 2)
-    val result = projected
-      .execute()
-      .map(_.copy())
-      .collect()
-    result.zipWithIndex.foreach {
-      case (row, index) => {
-          if (index % 3 == 0)
-            assert(row(0) === true, s"boolean field value in line $index did not match (every third row)")
-          else
-            assert(row(0) === false, s"boolean field value in line $index did not match")
-        assert(row(1) === (index.toLong << 33), s"long field value in line $index did not match")
-        assert(row.size === 2, s"number of columns in projection in line $index is incorrect")
-      }
+  test("nested data - struct with array field") {
+    val data = (1 to 10).map(i => Tuple1((i, Seq("val_$i"))))
+    withParquetTable(data, "t") {
+      checkAnswer(sql("SELECT _1._2[0] FROM t"), data.map {
+        case Tuple1((_, Seq(string))) => Row(string)
+      })
     }
   }
 
-  test("Writing metadata from scratch for table CREATE") {
-    val job = new Job()
-    val path = new Path(getTempFilePath("testtable").getCanonicalFile.toURI.toString)
-    val fs: FileSystem = FileSystem.getLocal(ContextUtil.getConfiguration(job))
-    ParquetTypesConverter.writeMetaData(
-      ParquetTestData.testData.output,
-      path,
-      TestSQLContext.sparkContext.hadoopConfiguration)
-    assert(fs.exists(new Path(path, ParquetFileWriter.PARQUET_METADATA_FILE)))
-    val metaData = ParquetTypesConverter.readMetaData(path)
-    assert(metaData != null)
-    ParquetTestData
-      .testData
-      .parquetSchema
-      .checkContains(metaData.getFileMetaData.getSchema) // throws exception if incompatible
-    metaData
-      .getFileMetaData
-      .getSchema
-      .checkContains(ParquetTestData.testData.parquetSchema) // throws exception if incompatible
-    fs.delete(path, true)
+  test("nested data - array of struct") {
+    val data = (1 to 10).map(i => Tuple1(Seq(i -> "val_$i")))
+    withParquetTable(data, "t") {
+      checkAnswer(sql("SELECT _1[0]._2 FROM t"), data.map {
+        case Tuple1(Seq((_, string))) => Row(string)
+      })
+    }
   }
 
-  /**
-   * Computes the given [[ParquetRelation]] and returns its RDD.
-   *
-   * @param parquetRelation The Parquet relation.
-   * @return An RDD of Rows.
-   */
-  private def getRDD(parquetRelation: ParquetRelation): RDD[Row] = {
-    val scanner = new ParquetTableScan(
-      parquetRelation.output,
-      parquetRelation,
-      None)(TestSQLContext.sparkContext)
-    scanner
-      .execute
-      .map(_.copy())
+  test("SPARK-1913 regression: columns only referenced by pushed down filters should remain") {
+    withParquetTable((1 to 10).map(Tuple1.apply), "t") {
+      checkAnswer(sql("SELECT _1 FROM t WHERE _1 < 10"), (1 to 9).map(Row.apply(_)))
+    }
+  }
+
+  test("SPARK-5309 strings stored using dictionary compression in parquet") {
+    withParquetTable((0 until 1000).map(i => ("same", "run_" + i /100, 1)), "t") {
+
+      checkAnswer(sql("SELECT _1, _2, SUM(_3) FROM t GROUP BY _1, _2"),
+        (0 until 10).map(i => Row("same", "run_" + i, 100)))
+
+      checkAnswer(sql("SELECT _1, _2, SUM(_3) FROM t WHERE _2 = 'run_5' GROUP BY _1, _2"),
+        List(Row("same", "run_5", 100)))
+    }
   }
 }
 
+class ParquetDataSourceOnQuerySuite extends ParquetQuerySuiteBase with BeforeAndAfterAll {
+  val originalConf = sqlContext.conf.parquetUseDataSourceApi
+
+  override protected def beforeAll(): Unit = {
+    sqlContext.conf.setConf(SQLConf.PARQUET_USE_DATA_SOURCE_API, "true")
+  }
+
+  override protected def afterAll(): Unit = {
+    sqlContext.setConf(SQLConf.PARQUET_USE_DATA_SOURCE_API, originalConf.toString)
+  }
+}
+
+class ParquetDataSourceOffQuerySuite extends ParquetQuerySuiteBase with BeforeAndAfterAll {
+  val originalConf = sqlContext.conf.parquetUseDataSourceApi
+
+  override protected def beforeAll(): Unit = {
+    sqlContext.conf.setConf(SQLConf.PARQUET_USE_DATA_SOURCE_API, "false")
+  }
+
+  override protected def afterAll(): Unit = {
+    sqlContext.setConf(SQLConf.PARQUET_USE_DATA_SOURCE_API, originalConf.toString)
+  }
+}

@@ -20,14 +20,15 @@ package org.apache.spark.scheduler
 import java.io.{File, FileNotFoundException, IOException, PrintWriter}
 import java.text.SimpleDateFormat
 import java.util.{Date, Properties}
-import java.util.concurrent.LinkedBlockingQueue
 
 import scala.collection.mutable.HashMap
 
 import org.apache.spark._
+import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.executor.TaskMetrics
 
 /**
+ * :: DeveloperApi ::
  * A logger class to record runtime information for jobs in Spark. This class outputs one log file
  * for each Spark job, containing tasks start/stop and shuffle information. JobLogger is a subclass
  * of SparkListener, use addSparkListener to add JobLogger to a SparkContext after the SparkContext
@@ -38,7 +39,7 @@ import org.apache.spark.executor.TaskMetrics
  * to log application information as SparkListenerEvents. To enable this functionality, set
  * spark.eventLog.enabled to true.
  */
-
+@DeveloperApi
 @deprecated("Log application information by setting spark.eventLog.enabled.", "1.0.0")
 class JobLogger(val user: String, val logDirName: String) extends SparkListener with Logging {
 
@@ -56,18 +57,10 @@ class JobLogger(val user: String, val logDirName: String) extends SparkListener 
   private val stageIdToJobId = new HashMap[Int, Int]
   private val jobIdToStageIds = new HashMap[Int, Seq[Int]]
   private val dateFormat = new ThreadLocal[SimpleDateFormat]() {
-    override def initialValue() = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss")
+    override def initialValue(): SimpleDateFormat = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss")
   }
-  private val eventQueue = new LinkedBlockingQueue[SparkListenerEvent]
 
   createLogDir()
-
-  // The following 5 functions are used only in testing.
-  private[scheduler] def getLogDir = logDir
-  private[scheduler] def getJobIdToPrintWriter = jobIdToPrintWriter
-  private[scheduler] def getStageIdToJobId = stageIdToJobId
-  private[scheduler] def getJobIdToStageIds = jobIdToStageIds
-  private[scheduler] def getEventQueue = eventQueue
 
   /** Create a folder for log files, the folder's name is the creation time of jobLogger */
   protected def createLogDir() {
@@ -75,7 +68,7 @@ class JobLogger(val user: String, val logDirName: String) extends SparkListener 
     if (dir.exists()) {
       return
     }
-    if (dir.mkdirs() == false) {
+    if (!dir.mkdirs()) {
       // JobLogger should throw a exception rather than continue to construct this object.
       throw new IOException("create log directory error:" + logDir + "/" + logDirName + "/")
     }
@@ -158,21 +151,36 @@ class JobLogger(val user: String, val logDirName: String) extends SparkListener 
                " START_TIME=" + taskInfo.launchTime + " FINISH_TIME=" + taskInfo.finishTime +
                " EXECUTOR_ID=" + taskInfo.executorId +  " HOST=" + taskMetrics.hostname
     val executorRunTime = " EXECUTOR_RUN_TIME=" + taskMetrics.executorRunTime
-    val readMetrics = taskMetrics.shuffleReadMetrics match {
+    val gcTime = " GC_TIME=" + taskMetrics.jvmGCTime
+    val inputMetrics = taskMetrics.inputMetrics match {
       case Some(metrics) =>
-        " SHUFFLE_FINISH_TIME=" + metrics.shuffleFinishTime +
+        " READ_METHOD=" + metrics.readMethod.toString +
+        " INPUT_BYTES=" + metrics.bytesRead
+      case None => ""
+    }
+    val outputMetrics = taskMetrics.outputMetrics match {
+      case Some(metrics) =>
+        " OUTPUT_BYTES=" + metrics.bytesWritten
+      case None => ""
+    }
+    val shuffleReadMetrics = taskMetrics.shuffleReadMetrics match {
+      case Some(metrics) =>
         " BLOCK_FETCHED_TOTAL=" + metrics.totalBlocksFetched +
         " BLOCK_FETCHED_LOCAL=" + metrics.localBlocksFetched +
         " BLOCK_FETCHED_REMOTE=" + metrics.remoteBlocksFetched +
         " REMOTE_FETCH_WAIT_TIME=" + metrics.fetchWaitTime +
-        " REMOTE_BYTES_READ=" + metrics.remoteBytesRead
+        " REMOTE_BYTES_READ=" + metrics.remoteBytesRead +
+        " LOCAL_BYTES_READ=" + metrics.localBytesRead
       case None => ""
     }
     val writeMetrics = taskMetrics.shuffleWriteMetrics match {
-      case Some(metrics) => " SHUFFLE_BYTES_WRITTEN=" + metrics.shuffleBytesWritten
+      case Some(metrics) =>
+        " SHUFFLE_BYTES_WRITTEN=" + metrics.shuffleBytesWritten +
+        " SHUFFLE_WRITE_TIME=" + metrics.shuffleWriteTime
       case None => ""
     }
-    stageLogInfo(stageId, status + info + executorRunTime + readMetrics + writeMetrics)
+    stageLogInfo(stageId, status + info + executorRunTime + gcTime + inputMetrics + outputMetrics +
+      shuffleReadMetrics + writeMetrics)
   }
 
   /**
@@ -191,7 +199,11 @@ class JobLogger(val user: String, val logDirName: String) extends SparkListener 
    */
   override def onStageCompleted(stageCompleted: SparkListenerStageCompleted) {
     val stageId = stageCompleted.stageInfo.stageId
-    stageLogInfo(stageId, "STAGE_ID=%d STATUS=COMPLETED".format(stageId))
+    if (stageCompleted.stageInfo.failureReason.isEmpty) {
+      stageLogInfo(stageId, s"STAGE_ID=$stageId STATUS=COMPLETED")
+    } else {
+      stageLogInfo(stageId, s"STAGE_ID=$stageId STATUS=FAILED")
+    }
   }
 
   /**
@@ -201,7 +213,7 @@ class JobLogger(val user: String, val logDirName: String) extends SparkListener 
   override def onTaskEnd(taskEnd: SparkListenerTaskEnd) {
     val taskInfo = taskEnd.taskInfo
     var taskStatus = "TASK_TYPE=%s".format(taskEnd.taskType)
-    val taskMetrics = if (taskEnd.taskMetrics != null) taskEnd.taskMetrics else TaskMetrics.empty()
+    val taskMetrics = if (taskEnd.taskMetrics != null) taskEnd.taskMetrics else TaskMetrics.empty
     taskEnd.reason match {
       case Success => taskStatus += " STATUS=SUCCESS"
         recordTaskMetrics(taskEnd.stageId, taskStatus, taskInfo, taskMetrics)
@@ -209,7 +221,7 @@ class JobLogger(val user: String, val logDirName: String) extends SparkListener 
         taskStatus += " STATUS=RESUBMITTED TID=" + taskInfo.taskId +
                       " STAGE_ID=" + taskEnd.stageId
         stageLogInfo(taskEnd.stageId, taskStatus)
-      case FetchFailed(bmAddress, shuffleId, mapId, reduceId) =>
+      case FetchFailed(bmAddress, shuffleId, mapId, reduceId, message) =>
         taskStatus += " STATUS=FETCHFAILED TID=" + taskInfo.taskId + " STAGE_ID=" +
                       taskEnd.stageId + " SHUFFLE_ID=" + shuffleId + " MAP_ID=" +
                       mapId + " REDUCE_ID=" + reduceId
@@ -227,7 +239,7 @@ class JobLogger(val user: String, val logDirName: String) extends SparkListener 
     var info = "JOB_ID=" + jobId
     jobEnd.jobResult match {
       case JobSucceeded => info += " STATUS=SUCCESS"
-      case JobFailed(exception, _) =>
+      case JobFailed(exception) =>
         info += " STATUS=FAILED REASON="
         exception.getMessage.split("\\s+").foreach(info += _ + "_")
       case _ =>
@@ -244,7 +256,7 @@ class JobLogger(val user: String, val logDirName: String) extends SparkListener 
   protected def recordJobProperties(jobId: Int, properties: Properties) {
     if (properties != null) {
       val description = properties.getProperty(SparkContext.SPARK_JOB_DESCRIPTION, "")
-      jobLogInfo(jobId, description, false)
+      jobLogInfo(jobId, description, withTime = false)
     }
   }
 

@@ -17,63 +17,143 @@
 
 package org.apache.spark.repl
 
-import java.io.{ByteArrayOutputStream, InputStream}
-import java.net.{URI, URL, URLEncoder}
-import java.util.concurrent.{Executors, ExecutorService}
+import java.io.{IOException, ByteArrayOutputStream, InputStream}
+import java.net.{HttpURLConnection, URI, URL, URLEncoder}
 
-import org.apache.hadoop.conf.Configuration
+import scala.util.control.NonFatal
+
 import org.apache.hadoop.fs.{FileSystem, Path}
 
-import org.apache.spark.SparkEnv
+import org.apache.spark.{SparkConf, SparkEnv, Logging}
+import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.util.Utils
-
+import org.apache.spark.util.ParentClassLoader
 
 import com.esotericsoftware.reflectasm.shaded.org.objectweb.asm._
 import com.esotericsoftware.reflectasm.shaded.org.objectweb.asm.Opcodes._
 
-
 /**
  * A ClassLoader that reads classes from a Hadoop FileSystem or HTTP URI,
- * used to load classes defined by the interpreter when the REPL is used
+ * used to load classes defined by the interpreter when the REPL is used.
+ * Allows the user to specify if user class path should be first
  */
-class ExecutorClassLoader(classUri: String, parent: ClassLoader)
-extends ClassLoader(parent) {
+class ExecutorClassLoader(conf: SparkConf, classUri: String, parent: ClassLoader,
+    userClassPathFirst: Boolean) extends ClassLoader with Logging {
   val uri = new URI(classUri)
   val directory = uri.getPath
 
+  val parentLoader = new ParentClassLoader(parent)
+
+  // Allows HTTP connect and read timeouts to be controlled for testing / debugging purposes
+  private[repl] var httpUrlConnectionTimeoutMillis: Int = -1
+
   // Hadoop FileSystem object for our URI, if it isn't using HTTP
   var fileSystem: FileSystem = {
-    if (uri.getScheme() == "http") {
+    if (Set("http", "https", "ftp").contains(uri.getScheme)) {
       null
     } else {
-      FileSystem.get(uri, new Configuration())
+      FileSystem.get(uri, SparkHadoopUtil.get.newConfiguration(conf))
     }
   }
-  
+
   override def findClass(name: String): Class[_] = {
-    try {
-      val pathInDirectory = name.replace('.', '/') + ".class"
-      val inputStream = {
-        if (fileSystem != null) {
-          fileSystem.open(new Path(directory, pathInDirectory))
-        } else {
-          if (SparkEnv.get.securityManager.isAuthenticationEnabled()) {
-            val uri = new URI(classUri + "/" + urlEncode(pathInDirectory))
-            val newuri = Utils.constructURIForAuthentication(uri, SparkEnv.get.securityManager)
-            newuri.toURL().openStream()
-          } else {
-            new URL(classUri + "/" + urlEncode(pathInDirectory)).openStream()
+    userClassPathFirst match {
+      case true => findClassLocally(name).getOrElse(parentLoader.loadClass(name))
+      case false => {
+        try {
+          parentLoader.loadClass(name)
+        } catch {
+          case e: ClassNotFoundException => {
+            val classOption = findClassLocally(name)
+            classOption match {
+              case None => throw new ClassNotFoundException(name, e)
+              case Some(a) => a
+            }
           }
         }
       }
-      val bytes = readAndTransformClass(name, inputStream)
-      inputStream.close()
-      return defineClass(name, bytes, 0, bytes.length)
-    } catch {
-      case e: Exception => throw new ClassNotFoundException(name, e)
     }
   }
-  
+
+  private def getClassFileInputStreamFromHttpServer(pathInDirectory: String): InputStream = {
+    val url = if (SparkEnv.get.securityManager.isAuthenticationEnabled()) {
+      val uri = new URI(classUri + "/" + urlEncode(pathInDirectory))
+      val newuri = Utils.constructURIForAuthentication(uri, SparkEnv.get.securityManager)
+      newuri.toURL
+    } else {
+      new URL(classUri + "/" + urlEncode(pathInDirectory))
+    }
+    val connection: HttpURLConnection = Utils.setupSecureURLConnection(url.openConnection(),
+      SparkEnv.get.securityManager).asInstanceOf[HttpURLConnection]
+    // Set the connection timeouts (for testing purposes)
+    if (httpUrlConnectionTimeoutMillis != -1) {
+      connection.setConnectTimeout(httpUrlConnectionTimeoutMillis)
+      connection.setReadTimeout(httpUrlConnectionTimeoutMillis)
+    }
+    connection.connect()
+    try {
+      if (connection.getResponseCode != 200) {
+        // Close the error stream so that the connection is eligible for re-use
+        try {
+          connection.getErrorStream.close()
+        } catch {
+          case ioe: IOException =>
+            logError("Exception while closing error stream", ioe)
+        }
+        throw new ClassNotFoundException(s"Class file not found at URL $url")
+      } else {
+        connection.getInputStream
+      }
+    } catch {
+      case NonFatal(e) if !e.isInstanceOf[ClassNotFoundException] =>
+        connection.disconnect()
+        throw e
+    }
+  }
+
+  private def getClassFileInputStreamFromFileSystem(pathInDirectory: String): InputStream = {
+    val path = new Path(directory, pathInDirectory)
+    if (fileSystem.exists(path)) {
+      fileSystem.open(path)
+    } else {
+      throw new ClassNotFoundException(s"Class file not found at path $path")
+    }
+  }
+
+  def findClassLocally(name: String): Option[Class[_]] = {
+    val pathInDirectory = name.replace('.', '/') + ".class"
+    var inputStream: InputStream = null
+    try {
+      inputStream = {
+        if (fileSystem != null) {
+          getClassFileInputStreamFromFileSystem(pathInDirectory)
+        } else {
+          getClassFileInputStreamFromHttpServer(pathInDirectory)
+        }
+      }
+      val bytes = readAndTransformClass(name, inputStream)
+      Some(defineClass(name, bytes, 0, bytes.length))
+    } catch {
+      case e: ClassNotFoundException =>
+        // We did not find the class
+        logDebug(s"Did not load class $name from REPL class server at $uri", e)
+        None
+      case e: Exception =>
+        // Something bad happened while checking if the class exists
+        logError(s"Failed to check existence of class $name on REPL class server at $uri", e)
+        None
+    } finally {
+      if (inputStream != null) {
+        try {
+          inputStream.close()
+        } catch {
+          case e: Exception =>
+            logError("Exception while closing inputStream", e)
+        }
+      }
+    }
+  }
+
   def readAndTransformClass(name: String, in: InputStream): Array[Byte] = {
     if (name.startsWith("line") && name.endsWith("$iw$")) {
       // Class seems to be an interpreter "wrapper" object storing a val or var.

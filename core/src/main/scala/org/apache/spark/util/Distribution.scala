@@ -29,7 +29,7 @@ import scala.collection.immutable.IndexedSeq
  *
  * Assumes you are giving it a non-empty set of data
  */
-class Distribution(val data: Array[Double], val startIdx: Int, val endIdx: Int) {
+private[spark] class Distribution(val data: Array[Double], val startIdx: Int, val endIdx: Int) {
   require(startIdx < endIdx)
   def this(data: Traversable[Double]) = this(data.toArray, 0, data.size)
   java.util.Arrays.sort(data, startIdx, endIdx)
@@ -57,7 +57,7 @@ class Distribution(val data: Array[Double], val startIdx: Int, val endIdx: Int) 
     out.println
   }
 
-  def statCounter = StatCounter(data.slice(startIdx, endIdx))
+  def statCounter: StatCounter = StatCounter(data.slice(startIdx, endIdx))
 
   /**
    * print a summary of this distribution to the given PrintStream.
@@ -69,7 +69,7 @@ class Distribution(val data: Array[Double], val startIdx: Int, val endIdx: Int) 
   }
 }
 
-object Distribution {
+private[spark] object Distribution {
 
   def apply(data: Traversable[Double]): Option[Distribution] = {
     if (data.size > 0) {

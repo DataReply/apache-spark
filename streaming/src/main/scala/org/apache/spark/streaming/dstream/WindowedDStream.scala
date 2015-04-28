@@ -32,7 +32,7 @@ class WindowedDStream[T: ClassTag](
   extends DStream[T](parent.ssc) {
 
   if (!_windowDuration.isMultipleOf(parent.slideDuration)) {
-    throw new Exception("The window duration of windowed DStream (" + _slideDuration + ") " +
+    throw new Exception("The window duration of windowed DStream (" + _windowDuration + ") " +
     "must be a multiple of the slide duration of parent DStream (" + parent.slideDuration + ")")
   }
 
@@ -46,7 +46,7 @@ class WindowedDStream[T: ClassTag](
 
   def windowDuration: Duration =  _windowDuration
 
-  override def dependencies = List(parent)
+  override def dependencies: List[DStream[_]] = List(parent)
 
   override def slideDuration: Duration = _slideDuration
 

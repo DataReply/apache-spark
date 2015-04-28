@@ -18,6 +18,7 @@
 package org.apache.spark.graphx
 
 import scala.reflect.ClassTag
+import org.apache.spark.Logging
 
 
 /**
@@ -52,7 +53,7 @@ import scala.reflect.ClassTag
  * }}}
  *
  */
-object Pregel {
+object Pregel extends Logging {
 
   /**
    * Execute a Pregel-like iterative vertex-parallel abstraction.  The
@@ -77,8 +78,8 @@ object Pregel {
    *
    * @param graph the input graph.
    *
-   * @param initialMsg the message each vertex will receive at the on
-   * the first iteration
+   * @param initialMsg the message each vertex will receive at the first
+   * iteration
    *
    * @param maxIterations the maximum number of iterations to run for
    *
@@ -142,10 +143,14 @@ object Pregel {
       // hides oldMessages (depended on by newVerts), newVerts (depended on by messages), and the
       // vertices of prevG (depended on by newVerts, oldMessages, and the vertices of g).
       activeMessages = messages.count()
+
+      logInfo("Pregel finished iteration " + i)
+
       // Unpersist the RDDs hidden by newly-materialized RDDs
       oldMessages.unpersist(blocking=false)
       newVerts.unpersist(blocking=false)
       prevG.unpersistVertices(blocking=false)
+      prevG.edges.unpersist(blocking=false)
       // count the iteration
       i += 1
     }

@@ -17,28 +17,29 @@
 
 package org.apache.spark.streaming.mqtt
 
+import java.io.IOException
+import java.util.concurrent.Executors
+import java.util.Properties
+
+import scala.collection.JavaConversions._
 import scala.collection.Map
 import scala.collection.mutable.HashMap
-import scala.collection.JavaConversions._
 import scala.reflect.ClassTag
 
-import java.util.Properties
-import java.util.concurrent.Executors
-import java.io.IOException
-
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
 import org.eclipse.paho.client.mqttv3.MqttCallback
 import org.eclipse.paho.client.mqttv3.MqttClient
 import org.eclipse.paho.client.mqttv3.MqttClientPersistence
-import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
-import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
 import org.eclipse.paho.client.mqttv3.MqttException
 import org.eclipse.paho.client.mqttv3.MqttMessage
 import org.eclipse.paho.client.mqttv3.MqttTopic
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 
 import org.apache.spark.Logging
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.streaming.StreamingContext
 import org.apache.spark.streaming.dstream._
+import org.apache.spark.streaming.receiver.Receiver
 
 /**
  * Input stream that subscribe messages from a Mqtt Broker.
@@ -48,63 +49,63 @@ import org.apache.spark.streaming.dstream._
  * @param storageLevel RDD storage level.
  */
 
-private[streaming] 
-class MQTTInputDStream[T: ClassTag](
+private[streaming]
+class MQTTInputDStream(
     @transient ssc_ : StreamingContext,
     brokerUrl: String,
     topic: String,
     storageLevel: StorageLevel
-  ) extends NetworkInputDStream[T](ssc_) with Logging {
-  
-  def getReceiver(): NetworkReceiver[T] = {
-    new MQTTReceiver(brokerUrl, topic, storageLevel).asInstanceOf[NetworkReceiver[T]]
+  ) extends ReceiverInputDStream[String](ssc_) {
+
+  def getReceiver(): Receiver[String] = {
+    new MQTTReceiver(brokerUrl, topic, storageLevel)
   }
 }
 
-private[streaming] 
-class MQTTReceiver(brokerUrl: String,
-  topic: String,
-  storageLevel: StorageLevel
-  ) extends NetworkReceiver[Any] {
-  lazy protected val blockGenerator = new BlockGenerator(storageLevel)
-  
+private[streaming]
+class MQTTReceiver(
+    brokerUrl: String,
+    topic: String,
+    storageLevel: StorageLevel
+  ) extends Receiver[String](storageLevel) {
+
   def onStop() {
-    blockGenerator.stop()
+
   }
-  
+
   def onStart() {
 
-    blockGenerator.start()
-
-    // Set up persistence for messages 
-    var peristance: MqttClientPersistence = new MemoryPersistence()
+    // Set up persistence for messages
+    val persistence = new MemoryPersistence()
 
     // Initializing Mqtt Client specifying brokerUrl, clientID and MqttClientPersistance
-    var client: MqttClient = new MqttClient(brokerUrl, MqttClient.generateClientId(), peristance)
+    val client = new MqttClient(brokerUrl, MqttClient.generateClientId(), persistence)
 
-    // Connect to MqttBroker    
+    // Callback automatically triggers as and when new message arrives on specified topic
+    val callback = new MqttCallback() {
+
+      // Handles Mqtt message
+      override def messageArrived(topic: String, message: MqttMessage) {
+        store(new String(message.getPayload(),"utf-8"))
+      }
+
+      override def deliveryComplete(token: IMqttDeliveryToken) {
+      }
+
+      override def connectionLost(cause: Throwable) {
+        restart("Connection lost ", cause)
+      }
+    }
+
+    // Set up callback for MqttClient. This needs to happen before
+    // connecting or subscribing, otherwise messages may be lost
+    client.setCallback(callback)
+
+    // Connect to MqttBroker
     client.connect()
 
     // Subscribe to Mqtt topic
     client.subscribe(topic)
 
-    // Callback automatically triggers as and when new message arrives on specified topic
-    var callback: MqttCallback = new MqttCallback() {
-
-      // Handles Mqtt message 
-      override def messageArrived(arg0: String, arg1: MqttMessage) {
-        blockGenerator += new String(arg1.getPayload())
-      }
-
-      override def deliveryComplete(arg0: IMqttDeliveryToken) {
-      }
-
-      override def connectionLost(arg0: Throwable) {
-        logInfo("Connection lost " + arg0)
-      }
-    }
-
-    // Set up callback for MqttClient
-    client.setCallback(callback)
   }
 }

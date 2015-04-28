@@ -17,106 +17,138 @@
 
 package org.apache.spark.ui
 
-import org.eclipse.jetty.servlet.ServletContextHandler
-
-import org.apache.spark.{Logging, SecurityManager, SparkConf, SparkContext, SparkEnv}
+import org.apache.spark.{Logging, SecurityManager, SparkConf, SparkContext}
 import org.apache.spark.scheduler._
 import org.apache.spark.storage.StorageStatusListener
 import org.apache.spark.ui.JettyUtils._
-import org.apache.spark.ui.env.EnvironmentUI
-import org.apache.spark.ui.exec.ExecutorsUI
-import org.apache.spark.ui.jobs.JobProgressUI
-import org.apache.spark.ui.storage.BlockManagerUI
-import org.apache.spark.util.Utils
+import org.apache.spark.ui.env.{EnvironmentListener, EnvironmentTab}
+import org.apache.spark.ui.exec.{ExecutorsListener, ExecutorsTab}
+import org.apache.spark.ui.jobs.{JobsTab, JobProgressListener, StagesTab}
+import org.apache.spark.ui.storage.{StorageListener, StorageTab}
 
-/** Top level user interface for Spark */
-private[spark] class SparkUI(
-    val sc: SparkContext,
-    conf: SparkConf,
-    val listenerBus: SparkListenerBus,
-    val appName: String,
-    val basePath: String = "")
-  extends Logging {
+/**
+ * Top level user interface for a Spark application.
+ */
+private[spark] class SparkUI private (
+    val sc: Option[SparkContext],
+    val conf: SparkConf,
+    val securityManager: SecurityManager,
+    val environmentListener: EnvironmentListener,
+    val storageStatusListener: StorageStatusListener,
+    val executorsListener: ExecutorsListener,
+    val jobProgressListener: JobProgressListener,
+    val storageListener: StorageListener,
+    var appName: String,
+    val basePath: String)
+  extends WebUI(securityManager, SparkUI.getUIPort(conf), conf, basePath, "SparkUI")
+  with Logging {
 
-  def this(sc: SparkContext) = this(sc, sc.conf, sc.listenerBus, sc.appName)
-  def this(conf: SparkConf, listenerBus: SparkListenerBus, appName: String, basePath: String) =
-    this(null, conf, listenerBus, appName, basePath)
+  val killEnabled = sc.map(_.conf.getBoolean("spark.ui.killEnabled", true)).getOrElse(false)
 
-  // If SparkContext is not provided, assume the associated application is not live
-  val live = sc != null
+  /** Initialize all components of the server. */
+  def initialize() {
+    attachTab(new JobsTab(this))
+    val stagesTab = new StagesTab(this)
+    attachTab(stagesTab)
+    attachTab(new StorageTab(this))
+    attachTab(new EnvironmentTab(this))
+    attachTab(new ExecutorsTab(this))
+    attachHandler(createStaticHandler(SparkUI.STATIC_RESOURCE_DIR, "/static"))
+    attachHandler(createRedirectHandler("/", "/jobs", basePath = basePath))
+    attachHandler(createRedirectHandler(
+      "/stages/stage/kill", "/stages", stagesTab.handleKillRequest, httpMethod = "POST"))
+  }
+  initialize()
 
-  val securityManager = if (live) sc.env.securityManager else new SecurityManager(conf)
+  def getAppName: String = appName
 
-  private val bindHost = Utils.localHostName()
-  private val publicHost = Option(System.getenv("SPARK_PUBLIC_DNS")).getOrElse(bindHost)
-  private val port = conf.get("spark.ui.port", SparkUI.DEFAULT_PORT).toInt
-  private var serverInfo: Option[ServerInfo] = None
-
-  private val storage = new BlockManagerUI(this)
-  private val jobs = new JobProgressUI(this)
-  private val env = new EnvironmentUI(this)
-  private val exec = new ExecutorsUI(this)
-
-  val handlers: Seq[ServletContextHandler] = {
-    val metricsServletHandlers = if (live) {
-      SparkEnv.get.metricsSystem.getServletHandlers
-    } else {
-      Array[ServletContextHandler]()
-    }
-    storage.getHandlers ++
-    jobs.getHandlers ++
-    env.getHandlers ++
-    exec.getHandlers ++
-    metricsServletHandlers ++
-    Seq[ServletContextHandler] (
-      createStaticHandler(SparkUI.STATIC_RESOURCE_DIR, "/static"),
-      createRedirectHandler("/", "/stages", basePath)
-    )
+  /** Set the app name for this UI. */
+  def setAppName(name: String) {
+    appName = name
   }
 
-  // Maintain executor storage status through Spark events
-  val storageStatusListener = new StorageStatusListener
-
-  /** Bind the HTTP server which backs this web interface */
-  def bind() {
-    try {
-      serverInfo = Some(startJettyServer(bindHost, port, handlers, sc.conf))
-      logInfo("Started Spark Web UI at http://%s:%d".format(publicHost, boundPort))
-    } catch {
-      case e: Exception =>
-        logError("Failed to create Spark JettyUtils", e)
-        System.exit(1)
-    }
+  /** Stop the server behind this web interface. Only valid after bind(). */
+  override def stop() {
+    super.stop()
+    logInfo("Stopped Spark web UI at %s".format(appUIAddress))
   }
 
-  def boundPort: Int = serverInfo.map(_.boundPort).getOrElse(-1)
+  /**
+   * Return the application UI host:port. This does not include the scheme (http://).
+   */
+  private[spark] def appUIHostPort = publicHostName + ":" + boundPort
 
-  /** Initialize all components of the server */
-  def start() {
-    storage.start()
-    jobs.start()
-    env.start()
-    exec.start()
+  private[spark] def appUIAddress = s"http://$appUIHostPort"
+}
 
-    // Storage status listener must receive events first, as other listeners depend on its state
-    listenerBus.addListener(storageStatusListener)
-    listenerBus.addListener(storage.listener)
-    listenerBus.addListener(jobs.listener)
-    listenerBus.addListener(env.listener)
-    listenerBus.addListener(exec.listener)
-  }
+private[spark] abstract class SparkUITab(parent: SparkUI, prefix: String)
+  extends WebUITab(parent, prefix) {
 
-  def stop() {
-    assert(serverInfo.isDefined, "Attempted to stop a SparkUI that was not bound to a server!")
-    serverInfo.get.server.stop()
-    logInfo("Stopped Spark Web UI at %s".format(appUIAddress))
-  }
-
-  private[spark] def appUIAddress = "http://" + publicHost + ":" + boundPort
+  def appName: String = parent.getAppName
 
 }
 
 private[spark] object SparkUI {
-  val DEFAULT_PORT = "4040"
+  val DEFAULT_PORT = 4040
   val STATIC_RESOURCE_DIR = "org/apache/spark/ui/static"
+
+  def getUIPort(conf: SparkConf): Int = {
+    conf.getInt("spark.ui.port", SparkUI.DEFAULT_PORT)
+  }
+
+  def createLiveUI(
+      sc: SparkContext,
+      conf: SparkConf,
+      listenerBus: SparkListenerBus,
+      jobProgressListener: JobProgressListener,
+      securityManager: SecurityManager,
+      appName: String): SparkUI =  {
+    create(Some(sc), conf, listenerBus, securityManager, appName,
+      jobProgressListener = Some(jobProgressListener))
+  }
+
+  def createHistoryUI(
+      conf: SparkConf,
+      listenerBus: SparkListenerBus,
+      securityManager: SecurityManager,
+      appName: String,
+      basePath: String): SparkUI = {
+    create(None, conf, listenerBus, securityManager, appName, basePath)
+  }
+
+  /**
+   * Create a new Spark UI.
+   *
+   * @param sc optional SparkContext; this can be None when reconstituting a UI from event logs.
+   * @param jobProgressListener if supplied, this JobProgressListener will be used; otherwise, the
+   *                            web UI will create and register its own JobProgressListener.
+   */
+  private def create(
+      sc: Option[SparkContext],
+      conf: SparkConf,
+      listenerBus: SparkListenerBus,
+      securityManager: SecurityManager,
+      appName: String,
+      basePath: String = "",
+      jobProgressListener: Option[JobProgressListener] = None): SparkUI = {
+
+    val _jobProgressListener: JobProgressListener = jobProgressListener.getOrElse {
+      val listener = new JobProgressListener(conf)
+      listenerBus.addListener(listener)
+      listener
+    }
+
+    val environmentListener = new EnvironmentListener
+    val storageStatusListener = new StorageStatusListener
+    val executorsListener = new ExecutorsListener(storageStatusListener)
+    val storageListener = new StorageListener(storageStatusListener)
+
+    listenerBus.addListener(environmentListener)
+    listenerBus.addListener(storageStatusListener)
+    listenerBus.addListener(executorsListener)
+    listenerBus.addListener(storageListener)
+
+    new SparkUI(sc, conf, securityManager, environmentListener, storageStatusListener,
+      executorsListener, _jobProgressListener, storageListener, appName, basePath)
+  }
 }

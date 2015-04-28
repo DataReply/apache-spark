@@ -20,135 +20,114 @@ package org.apache.spark.sql.columnar
 import java.nio.{ByteBuffer, ByteOrder}
 
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.catalyst.types._
 import org.apache.spark.sql.columnar.ColumnBuilder._
-import org.apache.spark.sql.execution.SparkSqlSerializer
+import org.apache.spark.sql.columnar.compression.{AllCompressionSchemes, CompressibleColumnBuilder}
+import org.apache.spark.sql.types._
 
 private[sql] trait ColumnBuilder {
   /**
    * Initializes with an approximate lower bound on the expected number of elements in this column.
    */
-  def initialize(initialSize: Int, columnName: String = "")
+  def initialize(initialSize: Int, columnName: String = "", useCompression: Boolean = false)
 
+  /**
+   * Appends `row(ordinal)` to the column builder.
+   */
   def appendFrom(row: Row, ordinal: Int)
 
+  /**
+   * Column statistics information
+   */
+  def columnStats: ColumnStats
+
+  /**
+   * Returns the final columnar byte buffer.
+   */
   def build(): ByteBuffer
 }
 
-private[sql] abstract class BasicColumnBuilder[T <: DataType, JvmType] extends ColumnBuilder {
+private[sql] class BasicColumnBuilder[T <: DataType, JvmType](
+    val columnStats: ColumnStats,
+    val columnType: ColumnType[T, JvmType])
+  extends ColumnBuilder {
 
-  private var columnName: String = _
+  protected var columnName: String = _
+
   protected var buffer: ByteBuffer = _
 
-  def columnType: ColumnType[T, JvmType]
+  override def initialize(
+      initialSize: Int,
+      columnName: String = "",
+      useCompression: Boolean = false): Unit = {
 
-  override def initialize(initialSize: Int, columnName: String = "") = {
     val size = if (initialSize == 0) DEFAULT_INITIAL_BUFFER_SIZE else initialSize
     this.columnName = columnName
-    buffer = ByteBuffer.allocate(4 + 4 + size * columnType.defaultSize)
+
+    // Reserves 4 bytes for column type ID
+    buffer = ByteBuffer.allocate(4 + size * columnType.defaultSize)
     buffer.order(ByteOrder.nativeOrder()).putInt(columnType.typeId)
   }
 
-  // Have to give a concrete implementation to make mixin possible
-  override def appendFrom(row: Row, ordinal: Int) {
-    doAppendFrom(row, ordinal)
+  override def appendFrom(row: Row, ordinal: Int): Unit = {
+    buffer = ensureFreeSpace(buffer, columnType.actualSize(row, ordinal))
+    columnType.append(row, ordinal, buffer)
   }
 
-  // Concrete `ColumnBuilder`s can override this method to append values
-  protected def doAppendFrom(row: Row, ordinal: Int)
-
-  // Helper method to append primitive values (to avoid boxing cost)
-  protected def appendValue(v: JvmType) {
-    buffer = ensureFreeSpace(buffer, columnType.actualSize(v))
-    columnType.append(v, buffer)
-  }
-
-  override def build() = {
-    buffer.limit(buffer.position()).rewind()
-    buffer
+  override def build(): ByteBuffer = {
+    buffer.flip().asInstanceOf[ByteBuffer]
   }
 }
 
-private[sql] abstract class NativeColumnBuilder[T <: NativeType](
-    val columnType: NativeColumnType[T])
-  extends BasicColumnBuilder[T, T#JvmType]
+private[sql] abstract class ComplexColumnBuilder[T <: DataType, JvmType](
+    columnStats: ColumnStats,
+    columnType: ColumnType[T, JvmType])
+  extends BasicColumnBuilder[T, JvmType](columnStats, columnType)
   with NullableColumnBuilder
 
-private[sql] class BooleanColumnBuilder extends NativeColumnBuilder(BOOLEAN) {
-  override def doAppendFrom(row: Row, ordinal: Int) {
-    appendValue(row.getBoolean(ordinal))
-  }
-}
+private[sql] abstract class NativeColumnBuilder[T <: AtomicType](
+    override val columnStats: ColumnStats,
+    override val columnType: NativeColumnType[T])
+  extends BasicColumnBuilder[T, T#InternalType](columnStats, columnType)
+  with NullableColumnBuilder
+  with AllCompressionSchemes
+  with CompressibleColumnBuilder[T]
 
-private[sql] class IntColumnBuilder extends NativeColumnBuilder(INT) {
-  override def doAppendFrom(row: Row, ordinal: Int) {
-    appendValue(row.getInt(ordinal))
-  }
-}
+private[sql] class BooleanColumnBuilder extends NativeColumnBuilder(new BooleanColumnStats, BOOLEAN)
 
-private[sql] class ShortColumnBuilder extends NativeColumnBuilder(SHORT) {
-  override def doAppendFrom(row: Row, ordinal: Int) {
-    appendValue(row.getShort(ordinal))
-  }
-}
+private[sql] class IntColumnBuilder extends NativeColumnBuilder(new IntColumnStats, INT)
 
-private[sql] class LongColumnBuilder extends NativeColumnBuilder(LONG) {
-  override def doAppendFrom(row: Row, ordinal: Int) {
-    appendValue(row.getLong(ordinal))
-  }
-}
+private[sql] class ShortColumnBuilder extends NativeColumnBuilder(new ShortColumnStats, SHORT)
 
-private[sql] class ByteColumnBuilder extends NativeColumnBuilder(BYTE) {
-  override def doAppendFrom(row: Row, ordinal: Int) {
-    appendValue(row.getByte(ordinal))
-  }
-}
+private[sql] class LongColumnBuilder extends NativeColumnBuilder(new LongColumnStats, LONG)
 
-private[sql] class DoubleColumnBuilder extends NativeColumnBuilder(DOUBLE) {
-  override def doAppendFrom(row: Row, ordinal: Int) {
-    appendValue(row.getDouble(ordinal))
-  }
-}
+private[sql] class ByteColumnBuilder extends NativeColumnBuilder(new ByteColumnStats, BYTE)
 
-private[sql] class FloatColumnBuilder extends NativeColumnBuilder(FLOAT) {
-  override def doAppendFrom(row: Row, ordinal: Int) {
-    appendValue(row.getFloat(ordinal))
-  }
-}
+private[sql] class DoubleColumnBuilder extends NativeColumnBuilder(new DoubleColumnStats, DOUBLE)
 
-private[sql] class StringColumnBuilder extends NativeColumnBuilder(STRING) {
-  override def doAppendFrom(row: Row, ordinal: Int) {
-    appendValue(row.getString(ordinal))
-  }
-}
+private[sql] class FloatColumnBuilder extends NativeColumnBuilder(new FloatColumnStats, FLOAT)
 
-private[sql] class BinaryColumnBuilder
-  extends BasicColumnBuilder[BinaryType.type, Array[Byte]]
-  with NullableColumnBuilder {
+private[sql] class FixedDecimalColumnBuilder(
+    precision: Int,
+    scale: Int)
+  extends NativeColumnBuilder(
+    new FixedDecimalColumnStats,
+    FIXED_DECIMAL(precision, scale))
 
-  def columnType = BINARY
+private[sql] class StringColumnBuilder extends NativeColumnBuilder(new StringColumnStats, STRING)
 
-  override def doAppendFrom(row: Row, ordinal: Int) {
-    appendValue(row(ordinal).asInstanceOf[Array[Byte]])
-  }
-}
+private[sql] class DateColumnBuilder extends NativeColumnBuilder(new DateColumnStats, DATE)
+
+private[sql] class TimestampColumnBuilder
+  extends NativeColumnBuilder(new TimestampColumnStats, TIMESTAMP)
+
+private[sql] class BinaryColumnBuilder extends ComplexColumnBuilder(new BinaryColumnStats, BINARY)
 
 // TODO (lian) Add support for array, struct and map
 private[sql] class GenericColumnBuilder
-  extends BasicColumnBuilder[DataType, Array[Byte]]
-  with NullableColumnBuilder {
-
-  def columnType = GENERIC
-
-  override def doAppendFrom(row: Row, ordinal: Int) {
-    val serialized = SparkSqlSerializer.serialize(row(ordinal))
-    buffer = ColumnBuilder.ensureFreeSpace(buffer, columnType.actualSize(serialized))
-    columnType.append(serialized, buffer)
-  }
-}
+  extends ComplexColumnBuilder(new GenericColumnStats, GENERIC)
 
 private[sql] object ColumnBuilder {
-  val DEFAULT_INITIAL_BUFFER_SIZE = 10 * 1024 * 104
+  val DEFAULT_INITIAL_BUFFER_SIZE = 1024 * 1024
 
   private[columnar] def ensureFreeSpace(orig: ByteBuffer, size: Int) = {
     if (orig.remaining >= size) {
@@ -159,7 +138,6 @@ private[sql] object ColumnBuilder {
       val newSize = capacity + size.max(capacity / 8 + 1)
       val pos = orig.position()
 
-      orig.clear()
       ByteBuffer
         .allocate(newSize)
         .order(ByteOrder.nativeOrder())
@@ -167,21 +145,29 @@ private[sql] object ColumnBuilder {
     }
   }
 
-  def apply(typeId: Int, initialSize: Int = 0, columnName: String = ""): ColumnBuilder = {
-    val builder = (typeId match {
-      case INT.typeId     => new IntColumnBuilder
-      case LONG.typeId    => new LongColumnBuilder
-      case FLOAT.typeId   => new FloatColumnBuilder
-      case DOUBLE.typeId  => new DoubleColumnBuilder
-      case BOOLEAN.typeId => new BooleanColumnBuilder
-      case BYTE.typeId    => new ByteColumnBuilder
-      case SHORT.typeId   => new ShortColumnBuilder
-      case STRING.typeId  => new StringColumnBuilder
-      case BINARY.typeId  => new BinaryColumnBuilder
-      case GENERIC.typeId => new GenericColumnBuilder
-    }).asInstanceOf[ColumnBuilder]
+  def apply(
+      dataType: DataType,
+      initialSize: Int = 0,
+      columnName: String = "",
+      useCompression: Boolean = false): ColumnBuilder = {
+    val builder: ColumnBuilder = dataType match {
+      case IntegerType => new IntColumnBuilder
+      case LongType => new LongColumnBuilder
+      case FloatType => new FloatColumnBuilder
+      case DoubleType => new DoubleColumnBuilder
+      case BooleanType => new BooleanColumnBuilder
+      case ByteType => new ByteColumnBuilder
+      case ShortType => new ShortColumnBuilder
+      case StringType => new StringColumnBuilder
+      case BinaryType => new BinaryColumnBuilder
+      case DateType => new DateColumnBuilder
+      case TimestampType => new TimestampColumnBuilder
+      case DecimalType.Fixed(precision, scale) if precision < 19 =>
+        new FixedDecimalColumnBuilder(precision, scale)
+      case _ => new GenericColumnBuilder
+    }
 
-    builder.initialize(initialSize, columnName)
+    builder.initialize(initialSize, columnName, useCompression)
     builder
   }
 }

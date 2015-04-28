@@ -22,12 +22,12 @@ import java.util.Properties
 import java.util.concurrent.TimeUnit
 
 import com.codahale.metrics.MetricRegistry
-import com.codahale.metrics.graphite.{Graphite, GraphiteReporter}
+import com.codahale.metrics.graphite.{GraphiteUDP, Graphite, GraphiteReporter}
 
 import org.apache.spark.SecurityManager
 import org.apache.spark.metrics.MetricsSystem
 
-class GraphiteSink(val property: Properties, val registry: MetricRegistry,
+private[spark] class GraphiteSink(val property: Properties, val registry: MetricRegistry,
     securityMgr: SecurityManager) extends Sink {
   val GRAPHITE_DEFAULT_PERIOD = 10
   val GRAPHITE_DEFAULT_UNIT = "SECONDS"
@@ -38,6 +38,7 @@ class GraphiteSink(val property: Properties, val registry: MetricRegistry,
   val GRAPHITE_KEY_PERIOD = "period"
   val GRAPHITE_KEY_UNIT = "unit"
   val GRAPHITE_KEY_PREFIX = "prefix"
+  val GRAPHITE_KEY_PROTOCOL = "protocol"
 
   def propertyToOption(prop: String): Option[String] = Option(property.getProperty(prop))
 
@@ -66,7 +67,11 @@ class GraphiteSink(val property: Properties, val registry: MetricRegistry,
 
   MetricsSystem.checkMinimalPollingPeriod(pollUnit, pollPeriod)
 
-  val graphite: Graphite = new Graphite(new InetSocketAddress(host, port))
+  val graphite = propertyToOption(GRAPHITE_KEY_PROTOCOL).map(_.toLowerCase) match {
+    case Some("udp") => new GraphiteUDP(new InetSocketAddress(host, port))
+    case Some("tcp") | None => new Graphite(new InetSocketAddress(host, port))
+    case Some(p) => throw new Exception(s"Invalid Graphite protocol: $p")
+  }
 
   val reporter: GraphiteReporter = GraphiteReporter.forRegistry(registry)
       .convertDurationsTo(TimeUnit.MILLISECONDS)
@@ -80,5 +85,9 @@ class GraphiteSink(val property: Properties, val registry: MetricRegistry,
 
   override def stop() {
     reporter.stop()
+  }
+
+  override def report() {
+    reporter.report()
   }
 }

@@ -19,16 +19,20 @@ package org.apache.spark.mllib.util
 
 import scala.util.Random
 
-import org.jblas.DoubleMatrix
+import com.github.fommil.netlib.BLAS.{getInstance => blas}
 
+import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
+import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.regression.LabeledPoint
 
 /**
+ * :: DeveloperApi ::
  * Generate sample data used for SVM. This class generates uniform random values
  * for the features and adds Gaussian noise with weight 0.1 to generate labels.
  */
+@DeveloperApi
 object SVMDataGenerator {
 
   def main(args: Array[String]) {
@@ -47,8 +51,7 @@ object SVMDataGenerator {
     val sc = new SparkContext(sparkMaster, "SVMGenerator")
 
     val globalRnd = new Random(94720)
-    val trueWeights = new DoubleMatrix(1, nfeatures + 1,
-      Array.fill[Double](nfeatures + 1)(globalRnd.nextGaussian()):_*)
+    val trueWeights = Array.fill[Double](nfeatures + 1)(globalRnd.nextGaussian())
 
     val data: RDD[LabeledPoint] = sc.parallelize(0 until nexamples, parts).map { idx =>
       val rnd = new Random(42 + idx)
@@ -56,12 +59,12 @@ object SVMDataGenerator {
       val x = Array.fill[Double](nfeatures) {
         rnd.nextDouble() * 2.0 - 1.0
       }
-      val yD = new DoubleMatrix(1, x.length, x: _*).dot(trueWeights) + rnd.nextGaussian() * 0.1
+      val yD = blas.ddot(trueWeights.length, x, 1, trueWeights, 1) + rnd.nextGaussian() * 0.1
       val y = if (yD < 0) 0.0 else 1.0
-      LabeledPoint(y, x)
+      LabeledPoint(y, Vectors.dense(x))
     }
 
-    MLUtils.saveLabeledData(data, outputPath)
+    data.saveAsTextFile(outputPath)
 
     sc.stop()
   }

@@ -20,11 +20,19 @@ package org.apache.spark.streaming.zeromq
 import akka.actor.SupervisorStrategy
 import akka.util.ByteString
 import akka.zeromq.Subscribe
+import org.scalatest.FunSuite
 
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark.streaming.{StreamingContext, TestSuiteBase}
+import org.apache.spark.streaming.{Seconds, StreamingContext}
+import org.apache.spark.streaming.dstream.ReceiverInputDStream
 
-class ZeroMQStreamSuite extends TestSuiteBase {
+class ZeroMQStreamSuite extends FunSuite {
+
+  val batchDuration = Seconds(1)
+
+  private val master: String = "local[2]"
+
+  private val framework: String = this.getClass.getSimpleName
 
   test("zeromq input stream") {
     val ssc = new StreamingContext(master, framework, batchDuration)
@@ -33,10 +41,12 @@ class ZeroMQStreamSuite extends TestSuiteBase {
     val bytesToObjects = (bytes: Seq[ByteString]) => null.asInstanceOf[Iterator[String]]
 
     // tests the API, does not actually test data receiving
-    val test1 = ZeroMQUtils.createStream(ssc, publishUrl, subscribe, bytesToObjects)
-    val test2 = ZeroMQUtils.createStream(
+    val test1: ReceiverInputDStream[String] =
+      ZeroMQUtils.createStream(ssc, publishUrl, subscribe, bytesToObjects)
+    val test2: ReceiverInputDStream[String] = ZeroMQUtils.createStream(
       ssc, publishUrl, subscribe, bytesToObjects, StorageLevel.MEMORY_AND_DISK_SER_2)
-    val test3 = ZeroMQUtils.createStream(ssc, publishUrl, subscribe, bytesToObjects,
+    val test3: ReceiverInputDStream[String] = ZeroMQUtils.createStream(
+      ssc, publishUrl, subscribe, bytesToObjects,
       StorageLevel.MEMORY_AND_DISK_SER_2, SupervisorStrategy.defaultStrategy)
 
     // TODO: Actually test data receiving

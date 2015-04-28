@@ -17,8 +17,9 @@
 
 package org.apache.spark.sql.catalyst.plans.physical
 
-import org.apache.spark.sql.catalyst.expressions.{Expression, SortOrder}
-import org.apache.spark.sql.catalyst.types.IntegerType
+import org.apache.spark.sql.catalyst.errors.TreeNodeException
+import org.apache.spark.sql.catalyst.expressions.{Expression, Row, SortOrder}
+import org.apache.spark.sql.types.{DataType, IntegerType}
 
 /**
  * Specifies how tuples that share common expressions will be distributed when a query is executed
@@ -45,7 +46,7 @@ case object AllTuples extends Distribution
 
 /**
  * Represents data where tuples that share the same values for the `clustering`
- * [[catalyst.expressions.Expression Expressions]] will be co-located. Based on the context, this
+ * [[Expression Expressions]] will be co-located. Based on the context, this
  * can mean such tuples are either co-located in the same partition or they will be contiguous
  * within a single partition.
  */
@@ -59,7 +60,7 @@ case class ClusteredDistribution(clustering: Seq[Expression]) extends Distributi
 
 /**
  * Represents data where tuples have been ordered according to the `ordering`
- * [[catalyst.expressions.Expression Expressions]].  This is a strictly stronger guarantee than
+ * [[Expression Expressions]].  This is a strictly stronger guarantee than
  * [[ClusteredDistribution]] as an ordering will ensure that tuples that share the same value for
  * the ordering expressions are contiguous and will never be split across partitions.
  */
@@ -70,7 +71,8 @@ case class OrderedDistribution(ordering: Seq[SortOrder]) extends Distribution {
       "An AllTuples should be used to represent a distribution that only has " +
       "a single partition.")
 
-  def clustering = ordering.map(_.child).toSet
+  // TODO: This is not really valid...
+  def clustering: Set[Expression] = ordering.map(_.child).toSet
 }
 
 sealed trait Partitioning {
@@ -78,22 +80,23 @@ sealed trait Partitioning {
   val numPartitions: Int
 
   /**
-   * Returns true iff the guarantees made by this
-   * [[catalyst.plans.physical.Partitioning Partitioning]] are sufficient to satisfy
-   * the partitioning scheme mandated by the `required`
-   * [[catalyst.plans.physical.Distribution Distribution]], i.e. the current dataset does not
-   * need to be re-partitioned for the `required` Distribution (it is possible that tuples within
-   * a partition need to be reorganized).
+   * Returns true iff the guarantees made by this [[Partitioning]] are sufficient
+   * to satisfy the partitioning scheme mandated by the `required` [[Distribution]],
+   * i.e. the current dataset does not need to be re-partitioned for the `required`
+   * Distribution (it is possible that tuples within a partition need to be reorganized).
    */
   def satisfies(required: Distribution): Boolean
 
   /**
    * Returns true iff all distribution guarantees made by this partitioning can also be made
    * for the `other` specified partitioning.
-   * For example, two [[catalyst.plans.physical.HashPartitioning HashPartitioning]]s are
+   * For example, two [[HashPartitioning HashPartitioning]]s are
    * only compatible if the `numPartitions` of them is the same.
    */
   def compatibleWith(other: Partitioning): Boolean
+
+  /** Returns the expressions that are used to key the partitioning. */
+  def keyExpressions: Seq[Expression]
 }
 
 case class UnknownPartitioning(numPartitions: Int) extends Partitioning {
@@ -106,6 +109,8 @@ case class UnknownPartitioning(numPartitions: Int) extends Partitioning {
     case UnknownPartitioning(_) => true
     case _ => false
   }
+
+  override def keyExpressions: Seq[Expression] = Nil
 }
 
 case object SinglePartition extends Partitioning {
@@ -113,10 +118,12 @@ case object SinglePartition extends Partitioning {
 
   override def satisfies(required: Distribution): Boolean = true
 
-  override def compatibleWith(other: Partitioning) = other match {
+  override def compatibleWith(other: Partitioning): Boolean = other match {
     case SinglePartition => true
     case _ => false
   }
+
+  override def keyExpressions: Seq[Expression] = Nil
 }
 
 case object BroadcastPartitioning extends Partitioning {
@@ -124,10 +131,12 @@ case object BroadcastPartitioning extends Partitioning {
 
   override def satisfies(required: Distribution): Boolean = true
 
-  override def compatibleWith(other: Partitioning) = other match {
+  override def compatibleWith(other: Partitioning): Boolean = other match {
     case SinglePartition => true
     case _ => false
   }
+
+  override def keyExpressions: Seq[Expression] = Nil
 }
 
 /**
@@ -139,12 +148,11 @@ case class HashPartitioning(expressions: Seq[Expression], numPartitions: Int)
   extends Expression
   with Partitioning {
 
-  def children = expressions
-  def references = expressions.flatMap(_.references).toSet
-  def nullable = false
-  def dataType = IntegerType
+  override def children: Seq[Expression] = expressions
+  override def nullable: Boolean = false
+  override def dataType: DataType = IntegerType
 
-  lazy val clusteringSet = expressions.toSet
+  private[this] lazy val clusteringSet = expressions.toSet
 
   override def satisfies(required: Distribution): Boolean = required match {
     case UnspecifiedDistribution => true
@@ -153,11 +161,16 @@ case class HashPartitioning(expressions: Seq[Expression], numPartitions: Int)
     case _ => false
   }
 
-  override def compatibleWith(other: Partitioning) = other match {
+  override def compatibleWith(other: Partitioning): Boolean = other match {
     case BroadcastPartitioning => true
     case h: HashPartitioning if h == this => true
     case _ => false
   }
+
+  override def keyExpressions: Seq[Expression] = expressions
+
+  override def eval(input: Row = null): EvaluatedType =
+    throw new TreeNodeException(this, s"No function to evaluate expression. type: ${this.nodeName}")
 }
 
 /**
@@ -168,17 +181,19 @@ case class HashPartitioning(expressions: Seq[Expression], numPartitions: Int)
  *    partition.
  *  - Each partition will have a `min` and `max` row, relative to the given ordering.  All rows
  *    that are in between `min` and `max` in this `ordering` will reside in this partition.
+ *
+ * This class extends expression primarily so that transformations over expression will descend
+ * into its child.
  */
 case class RangePartitioning(ordering: Seq[SortOrder], numPartitions: Int)
   extends Expression
   with Partitioning {
 
-  def children = ordering
-  def references = ordering.flatMap(_.references).toSet
-  def nullable = false
-  def dataType = IntegerType
+  override def children: Seq[SortOrder] = ordering
+  override def nullable: Boolean = false
+  override def dataType: DataType = IntegerType
 
-  lazy val clusteringSet = ordering.map(_.child).toSet
+  private[this] lazy val clusteringSet = ordering.map(_.child).toSet
 
   override def satisfies(required: Distribution): Boolean = required match {
     case UnspecifiedDistribution => true
@@ -190,9 +205,14 @@ case class RangePartitioning(ordering: Seq[SortOrder], numPartitions: Int)
     case _ => false
   }
 
-  override def compatibleWith(other: Partitioning) = other match {
+  override def compatibleWith(other: Partitioning): Boolean = other match {
     case BroadcastPartitioning => true
     case r: RangePartitioning if r == this => true
     case _ => false
   }
+
+  override def keyExpressions: Seq[Expression] = ordering.map(_.child)
+
+  override def eval(input: Row): EvaluatedType =
+    throw new TreeNodeException(this, s"No function to evaluate expression. type: ${this.nodeName}")
 }

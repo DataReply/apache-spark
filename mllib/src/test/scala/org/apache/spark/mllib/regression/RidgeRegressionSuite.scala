@@ -17,35 +17,46 @@
 
 package org.apache.spark.mllib.regression
 
+import scala.util.Random
+
 import org.jblas.DoubleMatrix
 import org.scalatest.FunSuite
 
-import org.apache.spark.mllib.util.{LinearDataGenerator, LocalSparkContext}
+import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.mllib.util.{LocalClusterSparkContext, LinearDataGenerator,
+  MLlibTestSparkContext}
+import org.apache.spark.util.Utils
 
-class RidgeRegressionSuite extends FunSuite with LocalSparkContext {
+private object RidgeRegressionSuite {
 
-  def predictionError(predictions: Seq[Double], input: Seq[LabeledPoint]) = {
+  /** 3 features */
+  val model = new RidgeRegressionModel(weights = Vectors.dense(0.1, 0.2, 0.3), intercept = 0.5)
+}
+
+class RidgeRegressionSuite extends FunSuite with MLlibTestSparkContext {
+
+  def predictionError(predictions: Seq[Double], input: Seq[LabeledPoint]): Double = {
     predictions.zip(input).map { case (prediction, expected) =>
       (prediction - expected.label) * (prediction - expected.label)
     }.reduceLeft(_ + _) / predictions.size
   }
 
-  test("regularization with skewed weights") {
-    val nexamples = 200
-    val nfeatures = 20
-    val eps = 10
+  test("ridge regression can help avoid overfitting") {
+
+    // For small number of examples and large variance of error distribution,
+    // ridge regression should give smaller generalization error that linear regression.
+
+    val numExamples = 50
+    val numFeatures = 20
 
     org.jblas.util.Random.seed(42)
     // Pick weights as random values distributed uniformly in [-0.5, 0.5]
-    val w = DoubleMatrix.rand(nfeatures, 1).subi(0.5)
-    // Set first two weights to eps
-    w.put(0, 0, eps)
-    w.put(1, 0, eps)
+    val w = DoubleMatrix.rand(numFeatures, 1).subi(0.5)
 
     // Use half of data for training and other half for validation
-    val data = LinearDataGenerator.generateLinearInput(3.0, w.toArray, 2*nexamples, 42, eps)
-    val testData = data.take(nexamples)
-    val validationData = data.takeRight(nexamples)
+    val data = LinearDataGenerator.generateLinearInput(3.0, w.toArray, 2 * numExamples, 42, 10.0)
+    val testData = data.take(numExamples)
+    val validationData = data.takeRight(numExamples)
 
     val testRDD = sc.parallelize(testData, 2).cache()
     val validationRDD = sc.parallelize(validationData, 2).cache()
@@ -67,14 +78,41 @@ class RidgeRegressionSuite extends FunSuite with LocalSparkContext {
     val ridgeErr = predictionError(
         ridgeModel.predict(validationRDD.map(_.features)).collect(), validationData)
 
-    // Ridge CV-error should be lower than linear regression
+    // Ridge validation error should be lower than linear regression.
     assert(ridgeErr < linearErr,
       "ridgeError (" + ridgeErr + ") was not less than linearError(" + linearErr + ")")
   }
 
-  test("do not support intercept") {
-    intercept[UnsupportedOperationException] {
-      new RidgeRegressionWithSGD().setIntercept(true)
+  test("model save/load") {
+    val model = RidgeRegressionSuite.model
+
+    val tempDir = Utils.createTempDir()
+    val path = tempDir.toURI.toString
+
+    // Save model, load it back, and compare.
+    try {
+      model.save(sc, path)
+      val sameModel = RidgeRegressionModel.load(sc, path)
+      assert(model.weights == sameModel.weights)
+      assert(model.intercept == sameModel.intercept)
+    } finally {
+      Utils.deleteRecursively(tempDir)
     }
+  }
+}
+
+class RidgeRegressionClusterSuite extends FunSuite with LocalClusterSparkContext {
+
+  test("task size should be small in both training and prediction") {
+    val m = 4
+    val n = 200000
+    val points = sc.parallelize(0 until m, 2).mapPartitionsWithIndex { (idx, iter) =>
+      val random = new Random(idx)
+      iter.map(i => LabeledPoint(1.0, Vectors.dense(Array.fill(n)(random.nextDouble()))))
+    }.cache()
+    // If we serialize data directly in the task closure, the size of the serialized task would be
+    // greater than 1MB and hence Spark would throw an error.
+    val model = RidgeRegressionWithSGD.train(points, 2)
+    val predictions = model.predict(points.map(_.features))
   }
 }

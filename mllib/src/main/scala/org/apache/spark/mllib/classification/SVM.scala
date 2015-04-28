@@ -18,13 +18,13 @@
 package org.apache.spark.mllib.classification
 
 import org.apache.spark.SparkContext
-import org.apache.spark.rdd.RDD
+import org.apache.spark.annotation.Experimental
+import org.apache.spark.mllib.classification.impl.GLMClassificationModel
+import org.apache.spark.mllib.linalg.Vector
 import org.apache.spark.mllib.optimization._
 import org.apache.spark.mllib.regression._
-import org.apache.spark.mllib.util.MLUtils
-import org.apache.spark.mllib.util.DataValidators
-
-import org.jblas.DoubleMatrix
+import org.apache.spark.mllib.util.{DataValidators, Loader, Saveable}
+import org.apache.spark.rdd.RDD
 
 /**
  * Model for Support Vector Machines (SVMs).
@@ -32,46 +32,122 @@ import org.jblas.DoubleMatrix
  * @param weights Weights computed for every feature.
  * @param intercept Intercept computed for this model.
  */
-class SVMModel(
-    override val weights: Array[Double],
+class SVMModel (
+    override val weights: Vector,
     override val intercept: Double)
-  extends GeneralizedLinearModel(weights, intercept)
-  with ClassificationModel with Serializable {
+  extends GeneralizedLinearModel(weights, intercept) with ClassificationModel with Serializable
+  with Saveable {
 
-  override def predictPoint(dataMatrix: DoubleMatrix, weightMatrix: DoubleMatrix,
+  private var threshold: Option[Double] = Some(0.0)
+
+  /**
+   * :: Experimental ::
+   * Sets the threshold that separates positive predictions from negative predictions. An example
+   * with prediction score greater than or equal to this threshold is identified as an positive,
+   * and negative otherwise. The default value is 0.0.
+   */
+  @Experimental
+  def setThreshold(threshold: Double): this.type = {
+    this.threshold = Some(threshold)
+    this
+  }
+
+  /**
+   * :: Experimental ::
+   * Returns the threshold (if any) used for converting raw prediction scores into 0/1 predictions.
+   */
+  @Experimental
+  def getThreshold: Option[Double] = threshold
+
+  /**
+   * :: Experimental ::
+   * Clears the threshold so that `predict` will output raw prediction scores.
+   */
+  @Experimental
+  def clearThreshold(): this.type = {
+    threshold = None
+    this
+  }
+
+  override protected def predictPoint(
+      dataMatrix: Vector,
+      weightMatrix: Vector,
       intercept: Double) = {
-    val margin = dataMatrix.dot(weightMatrix) + intercept
-    if (margin < 0) 0.0 else 1.0
+    val margin = weightMatrix.toBreeze.dot(dataMatrix.toBreeze) + intercept
+    threshold match {
+      case Some(t) => if (margin > t) 1.0 else 0.0
+      case None => margin
+    }
+  }
+
+  override def save(sc: SparkContext, path: String): Unit = {
+    GLMClassificationModel.SaveLoadV1_0.save(sc, path, this.getClass.getName,
+      numFeatures = weights.size, numClasses = 2, weights, intercept, threshold)
+  }
+
+  override protected def formatVersion: String = "1.0"
+
+  override def toString: String = {
+    s"${super.toString}, numClasses = 2, threshold = ${threshold.get}"
+  }
+}
+
+object SVMModel extends Loader[SVMModel] {
+
+  override def load(sc: SparkContext, path: String): SVMModel = {
+    val (loadedClassName, version, metadata) = Loader.loadMetadata(sc, path)
+    // Hard-code class name string in case it changes in the future
+    val classNameV1_0 = "org.apache.spark.mllib.classification.SVMModel"
+    (loadedClassName, version) match {
+      case (className, "1.0") if className == classNameV1_0 =>
+        val (numFeatures, numClasses) = ClassificationModel.getNumFeaturesClasses(metadata)
+        val data = GLMClassificationModel.SaveLoadV1_0.loadData(sc, path, classNameV1_0)
+        val model = new SVMModel(data.weights, data.intercept)
+        assert(model.weights.size == numFeatures, s"SVMModel.load with numFeatures=$numFeatures" +
+          s" was given non-matching weights vector of size ${model.weights.size}")
+        assert(numClasses == 2,
+          s"SVMModel.load was given numClasses=$numClasses but only supports 2 classes")
+        data.threshold match {
+          case Some(t) => model.setThreshold(t)
+          case None => model.clearThreshold()
+        }
+        model
+      case _ => throw new Exception(
+        s"SVMModel.load did not recognize model with (className, format version):" +
+        s"($loadedClassName, $version).  Supported:\n" +
+        s"  ($classNameV1_0, 1.0)")
+    }
   }
 }
 
 /**
- * Train a Support Vector Machine (SVM) using Stochastic Gradient Descent.
+ * Train a Support Vector Machine (SVM) using Stochastic Gradient Descent. By default L2
+ * regularization is used, which can be changed via [[SVMWithSGD.optimizer]].
  * NOTE: Labels used in SVM should be {0, 1}.
  */
 class SVMWithSGD private (
-    var stepSize: Double,
-    var numIterations: Int,
-    var regParam: Double,
-    var miniBatchFraction: Double)
+    private var stepSize: Double,
+    private var numIterations: Int,
+    private var regParam: Double,
+    private var miniBatchFraction: Double)
   extends GeneralizedLinearAlgorithm[SVMModel] with Serializable {
 
-  val gradient = new HingeGradient()
-  val updater = new SquaredL2Updater()
+  private val gradient = new HingeGradient()
+  private val updater = new SquaredL2Updater()
   override val optimizer = new GradientDescent(gradient, updater)
     .setStepSize(stepSize)
     .setNumIterations(numIterations)
     .setRegParam(regParam)
     .setMiniBatchFraction(miniBatchFraction)
-
-  override val validators = List(DataValidators.classificationLabels)
+  override protected val validators = List(DataValidators.binaryLabelValidator)
 
   /**
-   * Construct a SVM object with default parameters
+   * Construct a SVM object with default parameters: {stepSize: 1.0, numIterations: 100,
+   * regParm: 0.01, miniBatchFraction: 1.0}.
    */
-  def this() = this(1.0, 100, 1.0, 1.0)
+  def this() = this(1.0, 100, 0.01, 1.0)
 
-  def createModel(weights: Array[Double], intercept: Double) = {
+  override protected def createModel(weights: Vector, intercept: Double) = {
     new SVMModel(weights, intercept)
   }
 }
@@ -103,11 +179,9 @@ object SVMWithSGD {
       stepSize: Double,
       regParam: Double,
       miniBatchFraction: Double,
-      initialWeights: Array[Double])
-    : SVMModel =
-  {
-    new SVMWithSGD(stepSize, numIterations, regParam, miniBatchFraction).run(input,
-      initialWeights)
+      initialWeights: Vector): SVMModel = {
+    new SVMWithSGD(stepSize, numIterations, regParam, miniBatchFraction)
+      .run(input, initialWeights)
   }
 
   /**
@@ -127,9 +201,7 @@ object SVMWithSGD {
       numIterations: Int,
       stepSize: Double,
       regParam: Double,
-      miniBatchFraction: Double)
-    : SVMModel =
-  {
+      miniBatchFraction: Double): SVMModel = {
     new SVMWithSGD(stepSize, numIterations, regParam, miniBatchFraction).run(input)
   }
 
@@ -149,9 +221,7 @@ object SVMWithSGD {
       input: RDD[LabeledPoint],
       numIterations: Int,
       stepSize: Double,
-      regParam: Double)
-    : SVMModel =
-  {
+      regParam: Double): SVMModel = {
     train(input, numIterations, stepSize, regParam, 1.0)
   }
 
@@ -165,25 +235,7 @@ object SVMWithSGD {
    * @param numIterations Number of iterations of gradient descent to run.
    * @return a SVMModel which has the weights and offset from training.
    */
-  def train(
-      input: RDD[LabeledPoint],
-      numIterations: Int)
-    : SVMModel =
-  {
-    train(input, numIterations, 1.0, 1.0, 1.0)
-  }
-
-  def main(args: Array[String]) {
-    if (args.length != 5) {
-      println("Usage: SVM <master> <input_dir> <step_size> <regularization_parameter> <niters>")
-      System.exit(1)
-    }
-    val sc = new SparkContext(args(0), "SVM")
-    val data = MLUtils.loadLabeledData(sc, args(1))
-    val model = SVMWithSGD.train(data, args(4).toInt, args(2).toDouble, args(3).toDouble)
-    println("Weights: " + model.weights.mkString("[", ", ", "]"))
-    println("Intercept: " + model.intercept)
-
-    sc.stop()
+  def train(input: RDD[LabeledPoint], numIterations: Int): SVMModel = {
+    train(input, numIterations, 1.0, 0.01, 1.0)
   }
 }

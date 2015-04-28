@@ -55,7 +55,7 @@ class GraphOpsSuite extends FunSuite with LocalSparkContext {
       }
     }
   }
-  
+
   test ("filter") {
     withSpark { sc =>
       val n = 5
@@ -76,6 +76,21 @@ class GraphOpsSuite extends FunSuite with LocalSparkContext {
       // the map is necessary because of object-reuse in the edge iterator
       val e = filteredGraph.edges.map(e => Edge(e.srcId, e.dstId, e.attr)).collect().toSet
       assert(e.isEmpty)
+    }
+  }
+
+  test ("convertToCanonicalEdges") {
+    withSpark { sc =>
+      val vertices =
+        sc.parallelize(Seq[(VertexId, String)]((1, "one"), (2, "two"), (3, "three")), 2)
+      val edges =
+        sc.parallelize(Seq(Edge(1, 2, 1), Edge(2, 1, 1), Edge(3, 2, 2)))
+      val g: Graph[String, Int] = Graph(vertices, edges)
+
+      val g1 = g.convertToCanonicalEdges()
+
+      val e = g1.edges.collect().toSet
+      assert(e === Set(Edge(1, 2, 1), Edge(2, 3, 2)))
     }
   }
 
@@ -165,8 +180,11 @@ class GraphOpsSuite extends FunSuite with LocalSparkContext {
       // not have any edges in the specified direction.
       assert(edges.count === 50)
       edges.collect.foreach {
-        case (vid, edges) => if (vid > 0 && vid < 49) assert(edges.size == 2)
-        else assert(edges.size == 1)
+        case (vid, edges) => if (vid > 0 && vid < 49) {
+          assert(edges.size == 2)
+        } else {
+          assert(edges.size == 1)
+        }
       }
       edges.collect.foreach {
         case (vid, edges) =>

@@ -27,12 +27,21 @@ package org.apache
  * contains operations available only on RDDs of Doubles; and
  * [[org.apache.spark.rdd.SequenceFileRDDFunctions]] contains operations available on RDDs that can
  * be saved as SequenceFiles. These operations are automatically available on any RDD of the right
- * type (e.g. RDD[(Int, Int)] through implicit conversions when you
- * `import org.apache.spark.SparkContext._`.
+ * type (e.g. RDD[(Int, Int)] through implicit conversions.
  *
- * Java programmers should reference the [[spark.api.java]] package
+ * Java programmers should reference the [[org.apache.spark.api.java]] package
  * for Spark programming APIs in Java.
+ *
+ * Classes and methods marked with <span class="experimental badge" style="float: none;">
+ * Experimental</span> are user-facing features which have not been officially adopted by the
+ * Spark project. These are subject to change or removal in minor releases.
+ *
+ * Classes and methods marked with <span class="developer badge" style="float: none;">
+ * Developer API</span> are intended for advanced users want to extend Spark through lower
+ * level interfaces. These are subject to changes or removal in minor releases.
  */
+
 package object spark {
   // For package docs only
+  val SPARK_VERSION = "1.4.0-SNAPSHOT"
 }

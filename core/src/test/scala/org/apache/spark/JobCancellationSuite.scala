@@ -21,13 +21,12 @@ import java.util.concurrent.Semaphore
 
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContext.Implicits.global
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration._
 import scala.concurrent.future
 
 import org.scalatest.{BeforeAndAfter, FunSuite}
-import org.scalatest.matchers.ShouldMatchers
+import org.scalatest.Matchers
 
-import org.apache.spark.SparkContext._
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskStart}
 
 /**
@@ -35,18 +34,17 @@ import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskStart}
  * (e.g. count) as well as multi-job action (e.g. take). We test the local and cluster schedulers
  * in both FIFO and fair scheduling modes.
  */
-class JobCancellationSuite extends FunSuite with ShouldMatchers with BeforeAndAfter
+class JobCancellationSuite extends FunSuite with Matchers with BeforeAndAfter
   with LocalSparkContext {
 
   override def afterEach() {
     super.afterEach()
     resetSparkContext()
-    System.clearProperty("spark.scheduler.mode")
   }
 
   test("local mode, FIFO scheduler") {
-    System.setProperty("spark.scheduler.mode", "FIFO")
-    sc = new SparkContext("local[2]", "test")
+    val conf = new SparkConf().set("spark.scheduler.mode", "FIFO")
+    sc = new SparkContext("local[2]", "test", conf)
     testCount()
     testTake()
     // Make sure we can still launch tasks.
@@ -54,10 +52,10 @@ class JobCancellationSuite extends FunSuite with ShouldMatchers with BeforeAndAf
   }
 
   test("local mode, fair scheduler") {
-    System.setProperty("spark.scheduler.mode", "FAIR")
+    val conf = new SparkConf().set("spark.scheduler.mode", "FAIR")
     val xmlPath = getClass.getClassLoader.getResource("fairscheduler.xml").getFile()
-    System.setProperty("spark.scheduler.allocation.file", xmlPath)
-    sc = new SparkContext("local[2]", "test")
+    conf.set("spark.scheduler.allocation.file", xmlPath)
+    sc = new SparkContext("local[2]", "test", conf)
     testCount()
     testTake()
     // Make sure we can still launch tasks.
@@ -65,8 +63,8 @@ class JobCancellationSuite extends FunSuite with ShouldMatchers with BeforeAndAf
   }
 
   test("cluster mode, FIFO scheduler") {
-    System.setProperty("spark.scheduler.mode", "FIFO")
-    sc = new SparkContext("local-cluster[2,1,512]", "test")
+    val conf = new SparkConf().set("spark.scheduler.mode", "FIFO")
+    sc = new SparkContext("local-cluster[2,1,512]", "test", conf)
     testCount()
     testTake()
     // Make sure we can still launch tasks.
@@ -74,14 +72,43 @@ class JobCancellationSuite extends FunSuite with ShouldMatchers with BeforeAndAf
   }
 
   test("cluster mode, fair scheduler") {
-    System.setProperty("spark.scheduler.mode", "FAIR")
+    val conf = new SparkConf().set("spark.scheduler.mode", "FAIR")
     val xmlPath = getClass.getClassLoader.getResource("fairscheduler.xml").getFile()
-    System.setProperty("spark.scheduler.allocation.file", xmlPath)
-    sc = new SparkContext("local-cluster[2,1,512]", "test")
+    conf.set("spark.scheduler.allocation.file", xmlPath)
+    sc = new SparkContext("local-cluster[2,1,512]", "test", conf)
     testCount()
     testTake()
     // Make sure we can still launch tasks.
     assert(sc.parallelize(1 to 10, 2).count === 10)
+  }
+
+  test("do not put partially executed partitions into cache") {
+    // In this test case, we create a scenario in which a partition is only partially executed,
+    // and make sure CacheManager does not put that partially executed partition into the
+    // BlockManager.
+    import JobCancellationSuite._
+    sc = new SparkContext("local", "test")
+
+    // Run from 1 to 10, and then block and wait for the task to be killed.
+    val rdd = sc.parallelize(1 to 1000, 2).map { x =>
+      if (x > 10) {
+        taskStartedSemaphore.release()
+        taskCancelledSemaphore.acquire()
+      }
+      x
+    }.cache()
+
+    val rdd1 = rdd.map(x => x)
+
+    future {
+      taskStartedSemaphore.acquire()
+      sc.cancelAllJobs()
+      taskCancelledSemaphore.release(100000)
+    }
+
+    intercept[SparkException] { rdd1.count() }
+    // If the partial block is put into cache, rdd.count() would return a number less than 1000.
+    assert(rdd.count() === 1000)
   }
 
   test("job group") {
@@ -101,11 +128,11 @@ class JobCancellationSuite extends FunSuite with ShouldMatchers with BeforeAndAf
       sc.parallelize(1 to 10000, 2).map { i => Thread.sleep(10); i }.count()
     }
 
-    sc.clearJobGroup()
-    val jobB = sc.parallelize(1 to 100, 2).countAsync()
-
     // Block until both tasks of job A have started and cancel job A.
     sem.acquire(2)
+
+    sc.clearJobGroup()
+    val jobB = sc.parallelize(1 to 100, 2).countAsync()
     sc.cancelJobGroup("jobA")
     val e = intercept[SparkException] { Await.result(jobA, Duration.Inf) }
     assert(e.getMessage contains "cancel")
@@ -113,15 +140,45 @@ class JobCancellationSuite extends FunSuite with ShouldMatchers with BeforeAndAf
     // Once A is cancelled, job B should finish fairly quickly.
     assert(jobB.get() === 100)
   }
-/*
+
+  test("job group with interruption") {
+    sc = new SparkContext("local[2]", "test")
+
+    // Add a listener to release the semaphore once any tasks are launched.
+    val sem = new Semaphore(0)
+    sc.addSparkListener(new SparkListener {
+      override def onTaskStart(taskStart: SparkListenerTaskStart) {
+        sem.release()
+      }
+    })
+
+    // jobA is the one to be cancelled.
+    val jobA = future {
+      sc.setJobGroup("jobA", "this is a job to be cancelled", interruptOnCancel = true)
+      sc.parallelize(1 to 10000, 2).map { i => Thread.sleep(100000); i }.count()
+    }
+
+    // Block until both tasks of job A have started and cancel job A.
+    sem.acquire(2)
+
+    sc.clearJobGroup()
+    val jobB = sc.parallelize(1 to 100, 2).countAsync()
+    sc.cancelJobGroup("jobA")
+    val e = intercept[SparkException] { Await.result(jobA, 5.seconds) }
+    assert(e.getMessage contains "cancel")
+
+    // Once A is cancelled, job B should finish fairly quickly.
+    assert(jobB.get() === 100)
+  }
+
   test("two jobs sharing the same stage") {
     // sem1: make sure cancel is issued after some tasks are launched
-    // sem2: make sure the first stage is not finished until cancel is issued
+    // twoJobsSharingStageSemaphore:
+    //   make sure the first stage is not finished until cancel is issued
     val sem1 = new Semaphore(0)
-    val sem2 = new Semaphore(0)
 
     sc = new SparkContext("local[2]", "test")
-    sc.dagScheduler.addSparkListener(new SparkListener {
+    sc.addSparkListener(new SparkListener {
       override def onTaskStart(taskStart: SparkListenerTaskStart) {
         sem1.release()
       }
@@ -129,9 +186,9 @@ class JobCancellationSuite extends FunSuite with ShouldMatchers with BeforeAndAf
 
     // Create two actions that would share the some stages.
     val rdd = sc.parallelize(1 to 10, 2).map { i =>
-      sem2.acquire()
+      JobCancellationSuite.twoJobsSharingStageSemaphore.acquire()
       (i, i)
-    }.reduceByKey(_+_)
+    }.reduceByKey(_ + _)
     val f1 = rdd.collectAsync()
     val f2 = rdd.countAsync()
 
@@ -139,15 +196,15 @@ class JobCancellationSuite extends FunSuite with ShouldMatchers with BeforeAndAf
     future {
       sem1.acquire()
       f1.cancel()
-      sem2.release(10)
+      JobCancellationSuite.twoJobsSharingStageSemaphore.release(10)
     }
 
-    // Expect both to fail now.
-    // TODO: update this test when we change Spark so cancelling f1 wouldn't affect f2.
+    // Expect f1 to fail due to cancellation,
     intercept[SparkException] { f1.get() }
-    intercept[SparkException] { f2.get() }
+    // but f2 should not be affected
+    f2.get()
   }
- */
+
   def testCount() {
     // Cancel before launching any tasks
     {
@@ -205,4 +262,11 @@ class JobCancellationSuite extends FunSuite with ShouldMatchers with BeforeAndAf
       assert(e.getMessage.contains("cancelled") || e.getMessage.contains("killed"))
     }
   }
+}
+
+
+object JobCancellationSuite {
+  val taskStartedSemaphore = new Semaphore(0)
+  val taskCancelledSemaphore = new Semaphore(0)
+  val twoJobsSharingStageSemaphore = new Semaphore(0)
 }

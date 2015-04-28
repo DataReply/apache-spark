@@ -17,8 +17,14 @@
 
 package org.apache.spark.mllib.regression
 
+import org.json4s.{DefaultFormats, JValue}
+
+import org.apache.spark.annotation.Experimental
+import org.apache.spark.api.java.JavaRDD
+import org.apache.spark.mllib.linalg.Vector
 import org.apache.spark.rdd.RDD
 
+@Experimental
 trait RegressionModel extends Serializable {
   /**
    * Predict values for the given data set using the model trained.
@@ -26,7 +32,7 @@ trait RegressionModel extends Serializable {
    * @param testData RDD representing data points to be predicted
    * @return RDD[Double] where each entry contains the corresponding prediction
    */
-  def predict(testData: RDD[Array[Double]]): RDD[Double]
+  def predict(testData: RDD[Vector]): RDD[Double]
 
   /**
    * Predict values for a single data point using the model trained.
@@ -34,5 +40,25 @@ trait RegressionModel extends Serializable {
    * @param testData array representing a single data point
    * @return Double prediction from the trained model
    */
-  def predict(testData: Array[Double]): Double
+  def predict(testData: Vector): Double
+
+  /**
+   * Predict values for examples stored in a JavaRDD.
+   * @param testData JavaRDD representing data points to be predicted
+   * @return a JavaRDD[java.lang.Double] where each entry contains the corresponding prediction
+   */
+  def predict(testData: JavaRDD[Vector]): JavaRDD[java.lang.Double] =
+    predict(testData.rdd).toJavaRDD().asInstanceOf[JavaRDD[java.lang.Double]]
+}
+
+private[mllib] object RegressionModel {
+
+  /**
+   * Helper method for loading GLM regression model metadata.
+   * @return numFeatures
+   */
+  def getNumFeatures(metadata: JValue): Int = {
+    implicit val formats = DefaultFormats
+    (metadata \ "numFeatures").extract[Int]
+  }
 }

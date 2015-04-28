@@ -24,10 +24,8 @@ import org.apache.spark.scheduler.{Schedulable, StageInfo}
 import org.apache.spark.ui.UIUtils
 
 /** Table showing list of pools */
-private[ui] class PoolTable(pools: Seq[Schedulable], parent: JobProgressUI) {
-  private val basePath = parent.basePath
-  private val poolToActiveStages = listener.poolToActiveStages
-  private lazy val listener = parent.listener
+private[ui] class PoolTable(pools: Seq[Schedulable], parent: StagesTab) {
+  private val listener = parent.listener
 
   def toNodeSeq: Seq[Node] = {
     listener.synchronized {
@@ -48,7 +46,7 @@ private[ui] class PoolTable(pools: Seq[Schedulable], parent: JobProgressUI) {
         <th>SchedulingMode</th>
       </thead>
       <tbody>
-        {rows.map(r => makeRow(r, poolToActiveStages))}
+        {rows.map(r => makeRow(r, listener.poolToActiveStages))}
       </tbody>
     </table>
   }
@@ -60,11 +58,11 @@ private[ui] class PoolTable(pools: Seq[Schedulable], parent: JobProgressUI) {
       case Some(stages) => stages.size
       case None => 0
     }
+    val href = "%s/stages/pool?poolname=%s"
+      .format(UIUtils.prependBaseUri(parent.basePath), p.name)
     <tr>
       <td>
-        <a href={"%s/stages/pool?poolname=%s".format(UIUtils.prependBaseUri(basePath), p.name)}>
-          {p.name}
-        </a>
+        <a href={href}>{p.name}</a>
       </td>
       <td>{p.minShare}</td>
       <td>{p.weight}</td>

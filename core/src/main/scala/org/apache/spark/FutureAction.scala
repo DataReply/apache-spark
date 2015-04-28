@@ -17,12 +17,16 @@
 
 package org.apache.spark
 
-import scala.concurrent._
-import scala.concurrent.duration.Duration
-import scala.util.Try
+import java.util.Collections
+import java.util.concurrent.TimeUnit
 
+import org.apache.spark.api.java.JavaFutureAction
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.{JobFailed, JobSucceeded, JobWaiter}
+
+import scala.concurrent._
+import scala.concurrent.duration.Duration
+import scala.util.{Failure, Try}
 
 /**
  * A future for the result of an action to support cancellation. This is an extension of the
@@ -67,6 +71,11 @@ trait FutureAction[T] extends Future[T] {
   override def isCompleted: Boolean
 
   /**
+   * Returns whether the action has been cancelled.
+   */
+  def isCancelled: Boolean
+
+  /**
    * The value of this Future.
    *
    * If the future is not completed the returned value will be None. If the future is completed
@@ -80,6 +89,15 @@ trait FutureAction[T] extends Future[T] {
    */
   @throws(classOf[Exception])
   def get(): T = Await.result(this, Duration.Inf)
+
+  /**
+   * Returns the job IDs run by the underlying async operation.
+   *
+   * This returns the current snapshot of the job list. Certain operations may run multiple
+   * jobs, so multiple calls to this method may return different lists.
+   */
+  def jobIds: Seq[Int]
+
 }
 
 
@@ -90,7 +108,10 @@ trait FutureAction[T] extends Future[T] {
 class SimpleFutureAction[T] private[spark](jobWaiter: JobWaiter[_], resultFunc: => T)
   extends FutureAction[T] {
 
+  @volatile private var _cancelled: Boolean = false
+
   override def cancel() {
+    _cancelled = true
     jobWaiter.cancel()
   }
 
@@ -129,6 +150,8 @@ class SimpleFutureAction[T] private[spark](jobWaiter: JobWaiter[_], resultFunc: 
   }
 
   override def isCompleted: Boolean = jobWaiter.jobFinished
+  
+  override def isCancelled: Boolean = _cancelled
 
   override def value: Option[Try[T]] = {
     if (jobWaiter.jobFinished) {
@@ -141,9 +164,11 @@ class SimpleFutureAction[T] private[spark](jobWaiter: JobWaiter[_], resultFunc: 
   private def awaitResult(): Try[T] = {
     jobWaiter.awaitResult() match {
       case JobSucceeded => scala.util.Success(resultFunc)
-      case JobFailed(e: Exception, _) => scala.util.Failure(e)
+      case JobFailed(e: Exception) => scala.util.Failure(e)
     }
   }
+
+  def jobIds: Seq[Int] = Seq(jobWaiter.jobId)
 }
 
 
@@ -160,6 +185,8 @@ class ComplexFutureAction[T] extends FutureAction[T] {
   // A flag indicating whether the future has been cancelled. This is used in case the future
   // is cancelled before the action was even run (and thus we have no thread to interrupt).
   @volatile private var _cancelled: Boolean = false
+
+  @volatile private var jobs: Seq[Int] = Nil
 
   // A promise used to signal the future.
   private val p = promise[T]()
@@ -183,7 +210,11 @@ class ComplexFutureAction[T] extends FutureAction[T] {
       } catch {
         case e: Exception => p.failure(e)
       } finally {
-        thread = null
+        // This lock guarantees when calling `thread.interrupt()` in `cancel`,
+        // thread won't be set to null.
+        ComplexFutureAction.this.synchronized {
+          thread = null
+        }
       }
     }
     this
@@ -202,12 +233,14 @@ class ComplexFutureAction[T] extends FutureAction[T] {
     // If the action hasn't been cancelled yet, submit the job. The check and the submitJob
     // command need to be in an atomic block.
     val job = this.synchronized {
-      if (!cancelled) {
+      if (!isCancelled) {
         rdd.context.submitJob(rdd, processPartition, partitions, resultHandler, resultFunc)
       } else {
         throw new SparkException("Action has been cancelled")
       }
     }
+
+    this.jobs = jobs ++ job.jobIds
 
     // Wait for the job to complete. If the action is cancelled (with an interrupt),
     // cancel the job and stop the execution. This is not in a synchronized block because
@@ -221,10 +254,7 @@ class ComplexFutureAction[T] extends FutureAction[T] {
     }
   }
 
-  /**
-   * Returns whether the promise has been cancelled.
-   */
-  def cancelled: Boolean = _cancelled
+  override def isCancelled: Boolean = _cancelled
 
   @throws(classOf[InterruptedException])
   @throws(classOf[scala.concurrent.TimeoutException])
@@ -245,4 +275,59 @@ class ComplexFutureAction[T] extends FutureAction[T] {
   override def isCompleted: Boolean = p.isCompleted
 
   override def value: Option[Try[T]] = p.future.value
+
+  def jobIds: Seq[Int] = jobs
+
+}
+
+private[spark]
+class JavaFutureActionWrapper[S, T](futureAction: FutureAction[S], converter: S => T)
+  extends JavaFutureAction[T] {
+
+  import scala.collection.JavaConverters._
+
+  override def isCancelled: Boolean = futureAction.isCancelled
+
+  override def isDone: Boolean = {
+    // According to java.util.Future's Javadoc, this returns True if the task was completed,
+    // whether that completion was due to successful execution, an exception, or a cancellation.
+    futureAction.isCancelled || futureAction.isCompleted
+  }
+
+  override def jobIds(): java.util.List[java.lang.Integer] = {
+    Collections.unmodifiableList(futureAction.jobIds.map(Integer.valueOf).asJava)
+  }
+
+  private def getImpl(timeout: Duration): T = {
+    // This will throw TimeoutException on timeout:
+    Await.ready(futureAction, timeout)
+    futureAction.value.get match {
+      case scala.util.Success(value) => converter(value)
+      case Failure(exception) =>
+        if (isCancelled) {
+          throw new CancellationException("Job cancelled").initCause(exception)
+        } else {
+          // java.util.Future.get() wraps exceptions in ExecutionException
+          throw new ExecutionException("Exception thrown by job", exception)
+        }
+    }
+  }
+
+  override def get(): T = getImpl(Duration.Inf)
+
+  override def get(timeout: Long, unit: TimeUnit): T =
+    getImpl(Duration.fromNanos(unit.toNanos(timeout)))
+
+  override def cancel(mayInterruptIfRunning: Boolean): Boolean = synchronized {
+    if (isDone) {
+      // According to java.util.Future's Javadoc, this should return false if the task is completed.
+      false
+    } else {
+      // We're limited in terms of the semantics we can provide here; our cancellation is
+      // asynchronous and doesn't provide a mechanism to not cancel if the job is running.
+      futureAction.cancel()
+      true
+    }
+  }
+
 }

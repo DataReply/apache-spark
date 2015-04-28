@@ -20,61 +20,76 @@ include FileUtils
 
 if not (ENV['SKIP_API'] == '1' or ENV['SKIP_SCALADOC'] == '1')
   # Build Scaladoc for Java/Scala
-  core_projects = ["core", "examples", "repl", "bagel", "graphx", "streaming", "mllib"]
-  external_projects = ["flume", "kafka", "mqtt", "twitter", "zeromq"]
-  sql_projects = ["catalyst", "core", "hive"]
 
-  projects = core_projects + external_projects.map { |project_name| "external/" + project_name }
-
-  puts "Moving to project root and building scaladoc."
+  puts "Moving to project root and building API docs."
   curr_dir = pwd
   cd("..")
 
-  puts "Running sbt/sbt doc from " + pwd + "; this may take a few minutes..."
-  puts `sbt/sbt doc`
+  puts "Running 'build/sbt -Pkinesis-asl compile unidoc' from " + pwd + "; this may take a few minutes..."
+  puts `build/sbt -Pkinesis-asl compile unidoc`
 
   puts "Moving back into docs dir."
   cd("docs")
 
-  # Copy over the scaladoc from each project into the docs directory.
+  # Copy over the unified ScalaDoc for all projects to api/scala.
   # This directory will be copied over to _site when `jekyll` command is run.
-  projects.each do |project_name|
-    source = "../" + project_name + "/target/scala-2.10/api"
-    dest = "api/" + project_name
+  source = "../target/scala-2.10/unidoc"
+  dest = "api/scala"
 
-    puts "echo making directory " + dest
-    mkdir_p dest
+  puts "Making directory " + dest
+  mkdir_p dest
 
-    # From the rubydoc: cp_r('src', 'dest') makes src/dest, but this doesn't.
-    puts "cp -r " + source + "/. " + dest
-    cp_r(source + "/.", dest)
-  end
+  # From the rubydoc: cp_r('src', 'dest') makes src/dest, but this doesn't.
+  puts "cp -r " + source + "/. " + dest
+  cp_r(source + "/.", dest)
 
-  sql_projects.each do |project_name|
-    source = "../sql/" + project_name + "/target/scala-2.10/api/"
-    dest = "api/sql/" + project_name
+  # Append custom JavaScript
+  js = File.readlines("./js/api-docs.js")
+  js_file = dest + "/lib/template.js"
+  File.open(js_file, 'a') { |f| f.write("\n" + js.join()) }
 
-    puts "echo making directory " + dest
-    mkdir_p dest
+  # Append custom CSS
+  css = File.readlines("./css/api-docs.css")
+  css_file = dest + "/lib/template.css"
+  File.open(css_file, 'a') { |f| f.write("\n" + css.join()) }
 
-    # From the rubydoc: cp_r('src', 'dest') makes src/dest, but this doesn't.
-    puts "cp -r " + source + "/. " + dest
-    cp_r(source + "/.", dest)
-  end
+  # Copy over the unified JavaDoc for all projects to api/java.
+  source = "../target/javaunidoc"
+  dest = "api/java"
 
-  # Build Epydoc for Python
-  puts "Moving to python directory and building epydoc."
-  cd("../python")
-  puts `epydoc --config epydoc.conf`
+  puts "Making directory " + dest
+  mkdir_p dest
 
-  puts "Moving back into docs dir."
-  cd("../docs")
+  puts "cp -r " + source + "/. " + dest
+  cp_r(source + "/.", dest)
 
-  puts "echo making directory pyspark"
-  mkdir_p "pyspark"
+  # Build Sphinx docs for Python
 
-  puts "cp -r ../python/docs/. api/pyspark"
-  cp_r("../python/docs/.", "api/pyspark")
+  puts "Moving to python/docs directory and building sphinx."
+  cd("../python/docs")
+  puts `make html`
 
-  cd("..")
+  puts "Moving back into home dir."
+  cd("../../")
+
+  puts "Making directory api/python"
+  mkdir_p "docs/api/python"
+
+  puts "cp -r python/docs/_build/html/. docs/api/python"
+  cp_r("python/docs/_build/html/.", "docs/api/python")
+
+  # Build SparkR API docs
+  puts "Moving to R directory and building roxygen docs."
+  cd("R")
+  puts `./create-docs.sh`
+
+  puts "Moving back into home dir."
+  cd("../")
+
+  puts "Making directory api/R"
+  mkdir_p "docs/api/R"
+
+  puts "cp -r R/pkg/html/. docs/api/R"
+  cp_r("R/pkg/html/.", "docs/api/R")
+
 end

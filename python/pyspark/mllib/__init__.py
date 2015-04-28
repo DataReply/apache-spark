@@ -18,13 +18,21 @@
 """
 Python bindings for MLlib.
 """
+from __future__ import absolute_import
 
-# MLlib currently needs Python 2.7+ and NumPy 1.7+, so complain if lower
-
-import sys
-if sys.version_info[0:2] < (2, 7):
-    raise Exception("MLlib requires Python 2.7+")
+# MLlib currently needs NumPy 1.4+, so complain if lower
 
 import numpy
-if numpy.version.version < '1.7':
-    raise Exception("MLlib requires NumPy 1.7+")
+if numpy.version.version < '1.4':
+    raise Exception("MLlib requires NumPy 1.4+")
+
+__all__ = ['classification', 'clustering', 'feature', 'fpm', 'linalg', 'random',
+           'recommendation', 'regression', 'stat', 'tree', 'util']
+
+import sys
+from . import rand as random
+modname = __name__ + '.random'
+random.__name__ = modname
+random.RandomRDDs.__module__ = modname
+sys.modules[modname] = random
+del modname, sys

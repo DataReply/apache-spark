@@ -15,10 +15,9 @@
  * limitations under the License.
  */
 
-package org.apache.spark.sql
-package catalyst
-package rules
+package org.apache.spark.sql.catalyst.rules
 
+import org.apache.spark.Logging
 import org.apache.spark.sql.catalyst.trees.TreeNode
 import org.apache.spark.sql.catalyst.util.sideBySide
 
@@ -46,22 +45,22 @@ abstract class RuleExecutor[TreeType <: TreeNode[_]] extends Logging {
    * Executes the batches of rules defined by the subclass. The batches are executed serially
    * using the defined execution strategy. Within each batch, rules are also executed serially.
    */
-  def apply(plan: TreeType): TreeType = {
+  def execute(plan: TreeType): TreeType = {
     var curPlan = plan
 
     batches.foreach { batch =>
+      val batchStartPlan = curPlan
       var iteration = 1
       var lastPlan = curPlan
-      curPlan = batch.rules.foldLeft(curPlan) { case (plan, rule) => rule(plan) }
+      var continue = true
 
       // Run until fix point (or the max number of iterations as specified in the strategy.
-      while (iteration < batch.strategy.maxIterations && !curPlan.fastEquals(lastPlan)) {
-        lastPlan = curPlan
+      while (continue) {
         curPlan = batch.rules.foldLeft(curPlan) {
           case (plan, rule) =>
             val result = rule(plan)
             if (!result.fastEquals(plan)) {
-              logger.debug(
+              logTrace(
                 s"""
                   |=== Applying Rule ${rule.ruleName} ===
                   |${sideBySide(plan.treeString, result.treeString).mkString("\n")}
@@ -71,6 +70,30 @@ abstract class RuleExecutor[TreeType <: TreeNode[_]] extends Logging {
             result
         }
         iteration += 1
+        if (iteration > batch.strategy.maxIterations) {
+          // Only log if this is a rule that is supposed to run more than once.
+          if (iteration != 2) {
+            logInfo(s"Max iterations (${iteration - 1}) reached for batch ${batch.name}")
+          }
+          continue = false
+        }
+
+        if (curPlan.fastEquals(lastPlan)) {
+          logTrace(
+            s"Fixed point reached for batch ${batch.name} after ${iteration - 1} iterations.")
+          continue = false
+        }
+        lastPlan = curPlan
+      }
+
+      if (!batchStartPlan.fastEquals(curPlan)) {
+        logDebug(
+          s"""
+          |=== Result of Batch ${batch.name} ===
+          |${sideBySide(plan.treeString, curPlan.treeString).mkString("\n")}
+        """.stripMargin)
+      } else {
+        logTrace(s"Batch ${batch.name} has no effect.")
       }
     }
 

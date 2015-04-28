@@ -18,6 +18,7 @@
 package org.apache.spark.util.collection
 
 import scala.reflect._
+import com.google.common.hash.Hashing
 
 /**
  * A simple, fast hash set optimized for non-null insertion-only use case, where keys are never
@@ -84,7 +85,7 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
 
   protected var _bitset = new BitSet(_capacity)
 
-  def getBitSet = _bitset
+  def getBitSet: BitSet = _bitset
 
   // Init of the array in constructor (instead of in declaration) to work around a Scala compiler
   // specialization bug that would generate two arrays (one for Object and one for specialized T).
@@ -114,14 +115,14 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
    * The caller is responsible for calling rehashIfNeeded.
    *
    * Use (retval & POSITION_MASK) to get the actual position, and
-   * (retval & EXISTENCE_MASK) != 0 for prior existence.
+   * (retval & NONEXISTENCE_MASK) == 0 for prior existence.
    *
    * @return The position where the key is placed, plus the highest order bit is set if the key
-   *         exists previously.
+   *         does not exists previously.
    */
   def addWithoutResize(k: T): Int = {
     var pos = hashcode(hasher.hash(k)) & _mask
-    var i = 1
+    var delta = 1
     while (true) {
       if (!_bitset.get(pos)) {
         // This is a new key.
@@ -133,14 +134,12 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
         // Found an existing key.
         return pos
       } else {
-        val delta = i
+        // quadratic probing with values increase by 1, 2, 3, ...
         pos = (pos + delta) & _mask
-        i += 1
+        delta += 1
       }
     }
-    // Never reached here
-    assert(INVALID_POS != INVALID_POS)
-    INVALID_POS
+    throw new RuntimeException("Should never reach here.")
   }
 
   /**
@@ -162,27 +161,25 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
    */
   def getPos(k: T): Int = {
     var pos = hashcode(hasher.hash(k)) & _mask
-    var i = 1
-    val maxProbe = _data.size
-    while (i < maxProbe) {
+    var delta = 1
+    while (true) {
       if (!_bitset.get(pos)) {
         return INVALID_POS
       } else if (k == _data(pos)) {
         return pos
       } else {
-        val delta = i
+        // quadratic probing with values increase by 1, 2, 3, ...
         pos = (pos + delta) & _mask
-        i += 1
+        delta += 1
       }
     }
-    // Never reached here
-    INVALID_POS
+    throw new RuntimeException("Should never reach here.")
   }
 
   /** Return the value at the specified position. */
   def getValue(pos: Int): T = _data(pos)
 
-  def iterator = new Iterator[T] {
+  def iterator: Iterator[T] = new Iterator[T] {
     var pos = nextPos(0)
     override def hasNext: Boolean = pos != INVALID_POS
     override def next(): T = {
@@ -256,9 +253,8 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
 
   /**
    * Re-hash a value to deal better with hash functions that don't differ in the lower bits.
-   * We use the Murmur Hash 3 finalization step that's also used in fastutil.
    */
-  private def hashcode(h: Int): Int = it.unimi.dsi.fastutil.HashCommon.murmurHash3(h)
+  private def hashcode(h: Int): Int = Hashing.murmur3_32().hashInt(h).asInt()
 
   private def nextPowerOf2(n: Int): Int = {
     val highBit = Integer.highestOneBit(n)

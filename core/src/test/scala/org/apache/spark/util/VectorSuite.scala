@@ -24,9 +24,10 @@ import org.scalatest.FunSuite
 /**
  * Tests org.apache.spark.util.Vector functionality
  */
+@deprecated("suppress compile time deprecation warning", "1.0.0")
 class VectorSuite extends FunSuite {
 
-  def verifyVector(vector: Vector, expectedLength: Int) = {
+  def verifyVector(vector: Vector, expectedLength: Int): Unit = {
     assert(vector.length == expectedLength)
     assert(vector.elements.min > 0.0)
     assert(vector.elements.max < 1.0)
